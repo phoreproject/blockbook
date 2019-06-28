@@ -1,0 +1,65 @@
+{
+  "coin": {
+    "name": "Phore",
+    "shortcut": "PHR",
+    "label": "Phore",
+    "alias": "phore"
+  },
+  "ports": {
+    "backend_rpc": 8046,
+    "backend_message_queue": 38346,
+    "blockbook_internal": 9046,
+    "blockbook_public": 9146
+  },
+  "ipc": {
+    "rpc_url_template": "http://127.0.0.1:{{.Ports.BackendRPC}}",
+    "rpc_user": "rpc",
+    "rpc_pass": "rpc",
+    "rpc_timeout": 25,
+    "message_queue_binding_template": "tcp://127.0.0.1:{{.Ports.BackendMessageQueue}}"
+  },
+  "backend": {
+    "package_name": "backend-phore",
+    "package_revision": "satoshilabs-1",
+    "system_user": "phore",
+    "version": "v1.6.3",
+    "binary_url": "https://github.com/phoreproject/Phore/releases/download/v1.6.3/phore-1.6.3-x86_64-linux-gnu.tar.gz",
+    "verification_type": "gpg-sha256",
+    "verification_source": "",
+    "extract_command": "tar -C backend --strip 1 -xf",
+    "exclude_files": [
+      "bin/phore-qt"
+    ],
+    "exec_command_template": "{{.Env.BackendInstallPath}}/{{.Coin.Alias}}/bin/phored -datadir={{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend -conf={{.Env.BackendInstallPath}}/{{.Coin.Alias}}/{{.Coin.Alias}}.conf -pid=/run/{{.Coin.Alias}}/{{.Coin.Alias}}.pid",
+    "logrotate_files_template": "{{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend/*.log",
+    "postinst_script_template": "",
+    "service_type": "forking",
+    "service_additional_params_template": "",
+    "protect_memory": true,
+    "mainnet": true,
+    "server_config_file": "bitcoin_like.conf",
+    "client_config_file": "bitcoin_like_client.conf",
+    "additional_params": {
+      "deprecatedrpc": "estimatefee"
+    }
+  },
+  "blockbook": {
+    "package_name": "blockbook-phore",
+    "system_user": "blockbook-phore",
+    "internal_binding_template": ":{{.Ports.BlockbookInternal}}",
+    "public_binding_template": ":{{.Ports.BlockbookPublic}}",
+    "explorer_url": "",
+    "additional_params": "",
+    "block_chain": {
+      "parse": true,
+      "mempool_workers": 8,
+      "mempool_sub_workers": 2,
+      "block_addresses_to_keep": 300,
+      "additional_params": {}
+    }
+  },
+  "meta": {
+    "package_maintainer": "Mateusz Jachna",
+    "package_maintainer_email": "anchaj@phore.io"
+  }
+}
