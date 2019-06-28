@@ -1,0 +1,68 @@
+{
+  "coin": {
+    "name": "Reddcoin",
+    "shortcut": "RDD",
+    "label": "Reddcoin",
+    "alias": "reddcoin"
+  },
+  "ports": {
+    "backend_rpc": 8047,
+    "backend_message_queue": 38347,
+    "blockbook_internal": 9047,
+    "blockbook_public": 9147
+  },
+  "ipc": {
+    "rpc_url_template": "http://127.0.0.1:{{.Ports.BackendRPC}}",
+    "rpc_user": "rpc",
+    "rpc_pass": "rpc",
+    "rpc_timeout": 25,
+    "message_queue_binding_template": "tcp://127.0.0.1:{{.Ports.BackendMessageQueue}}"
+  },
+  "backend": {
+    "package_name": "backend-reddcoin",
+    "package_revision": "satoshilabs-1",
+    "system_user": "reddcoin",
+    "version": "v2.0.1.2",
+    "binary_url": "https://github.com/reddcoin-project/reddcoin/releases/download/v2.0.1.2/reddcoin-2.0.1.2-linux.tar.gz",
+    "verification_type": "gpg-sha256",
+    "verification_source": "https://github.com/reddcoin-project/reddcoin/releases/download/v2.0.1.2/SHA256SUMS.asc",
+    "extract_command": "tar -C backend --strip 1 -xf",
+    "exclude_files": [
+      "bin/32",
+      "bin/64/reddcoin-qt",
+      "bin/64/test_reddcoin",
+      "bin/64/test_reddcoin-qt",
+    ],
+    "exec_command_template": "{{.Env.BackendInstallPath}}/{{.Coin.Alias}}/bin/reddcoind -datadir={{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend -conf={{.Env.BackendInstallPath}}/{{.Coin.Alias}}/{{.Coin.Alias}}.conf -pid=/run/{{.Coin.Alias}}/{{.Coin.Alias}}.pid",
+    "logrotate_files_template": "{{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend/*.log",
+    "postinst_script_template": "",
+    "service_type": "forking",
+    "service_additional_params_template": "",
+    "protect_memory": true,
+    "mainnet": true,
+    "server_config_file": "bitcoin_like.conf",
+    "client_config_file": "bitcoin_like_client.conf",
+    "additional_params": {
+      "deprecatedrpc": "estimatefee"
+    }
+  },
+  "blockbook": {
+    "package_name": "blockbook-reddcoin",
+    "system_user": "blockbook-reddcoin",
+    "internal_binding_template": ":{{.Ports.BlockbookInternal}}",
+    "public_binding_template": ":{{.Ports.BlockbookPublic}}",
+    "explorer_url": "",
+    "additional_params": "",
+    "block_chain": {
+      "parse": true,
+      "mempool_workers": 8,
+      "mempool_sub_workers": 2,
+      "block_addresses_to_keep": 300,
+      "additional_params": {}
+    }
+  },
+  "meta": {
+    "package_maintainer": "Mateusz Jachna",
+    "package_maintainer_email": "anchaj@phore.io"
+  }
+}
