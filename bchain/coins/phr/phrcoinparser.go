@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
-	"github.com/jakm/btcutil/base58"
 	"github.com/jakm/btcutil/chaincfg"
 )
 
@@ -73,9 +72,9 @@ var PhoreMainNetParams = chaincfg.Params{
 	Bech32HRPSegwit: "ph", // always bc for main net
 
 	// Address encoding magics
-	PubKeyHashAddrID: [1]byte{0x37}, // starts with 1
-	ScriptHashAddrID: [1]byte{0x0d}, // starts with 3
-	PrivateKeyID:     [1]byte{0xd4}, // starts with 5 (uncompressed) or K (compressed)
+	PubKeyHashAddrID: []byte{0x37}, // starts with 1
+	ScriptHashAddrID: []byte{0x0d}, // starts with 3
+	PrivateKeyID:     []byte{0xd4}, // starts with 5 (uncompressed) or K (compressed)
 
 	// BIP32 hierarchical deterministic extended key magics
 	HDPrivateKeyID: [4]byte{0x02, 0x2d, 0x25, 0x33}, // starts with xprv

@@ -37,7 +37,7 @@ func (g *PhoreRPC) Initialize() error {
 	g.Parser = NewPhoreParser(params, g.ChainConfig)
 
 	// parameters for getInfo request
-	if params.Net == MainnetMagic {
+	if params.Net == MainPhoreNet {
 		g.Testnet = false
 		g.Network = "livenet"
 	} else {
