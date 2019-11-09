@@ -3,6 +3,7 @@ package phr
 import (
 	"blockbook/bchain"
 	"blockbook/bchain/coins/btc"
+	"math/big"
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
@@ -14,6 +15,19 @@ const (
 	// MainNet represents the main bitcoin network.
 	MainPhoreNet wire.BitcoinNet = 0x504852   // PHR
 	TestPhoreNet wire.BitcoinNet = 0x54504852 // TPHR
+)
+
+var (
+	// bigOne is 1 represented as a big.Int.  It is defined here to avoid
+	// the overhead of creating it multiple times.
+	bigOne = big.NewInt(1)
+
+	// mainPowLimit is the highest proof of work value a Bitcoin block can
+	// have for the main network.  It is the value 2^224 - 1.
+	mainPowLimit = new(big.Int).Sub(new(big.Int).Lsh(bigOne, 255), bigOne)
+
+	MainNetParams chaincfg.Params
+	TestNetParams chaincfg.Params
 )
 
 var PhoreMainNetParams = chaincfg.Params{
@@ -59,9 +73,9 @@ var PhoreMainNetParams = chaincfg.Params{
 	Bech32HRPSegwit: "ph", // always bc for main net
 
 	// Address encoding magics
-	PubKeyHashAddrID: 0x37, // starts with 1
-	ScriptHashAddrID: 0x0d, // starts with 3
-	PrivateKeyID:     0xd4, // starts with 5 (uncompressed) or K (compressed)
+	PubKeyHashAddrID: [1]byte{0x37}, // starts with 1
+	ScriptHashAddrID: [1]byte{0x0d}, // starts with 3
+	PrivateKeyID:     [1]byte{0xd4}, // starts with 5 (uncompressed) or K (compressed)
 
 	// BIP32 hierarchical deterministic extended key magics
 	HDPrivateKeyID: [4]byte{0x02, 0x2d, 0x25, 0x33}, // starts with xprv
