@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/jakm/btcutil/chaincfg"
 )
@@ -28,6 +29,14 @@ var (
 	MainNetParams chaincfg.Params
 	TestNetParams chaincfg.Params
 )
+
+func newHashFromStr(hexStr string) *chainhash.Hash {
+	hash, err := chainhash.NewHashFromStr(hexStr)
+	if err != nil {
+		panic(err)
+	}
+	return hash
+}
 
 var PhoreMainNetParams = chaincfg.Params{
 	Name:        "mainPhore",
@@ -62,7 +71,10 @@ var PhoreMainNetParams = chaincfg.Params{
 	//ModifierV2StartBlock:     433160,
 
 	// Checkpoints ordered from oldest to newest.
-	Checkpoints: []chaincfg.Checkpoint{},
+	Checkpoints: []chaincfg.Checkpoint{
+		{Height: 500000, Hash: newHashFromStr("efaab512d538c5de130a5e11459da65264699f552d69d7a960b0b8effabd97cb")},
+		{Height: 1000000, Hash: newHashFromStr("a88a1ad20733dda703a73c12916c0b77e6242a71b7f88ad827aee8bd9264c652")},
+	},
 
 	// Mempool parameters
 	RelayNonStdTxs: false,
