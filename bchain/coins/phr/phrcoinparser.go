@@ -71,6 +71,8 @@ var PhoreMainNetParams = chaincfg.Params{
 	// BIP 173.
 	Bech32HRPSegwit: "ph", // always bc for main net
 
+	AddressMagicLen: 1,
+
 	// Address encoding magics
 	PubKeyHashAddrID: []byte{0x37}, // starts with 1
 	ScriptHashAddrID: []byte{0x0d}, // starts with 3
@@ -100,7 +102,7 @@ type PhoreParser struct {
 	baseparser *bchain.BaseParser
 }
 
-// NewGroestlcoinParser returns new PhoreParser instance
+// NewPhoreParser returns new PhoreParser instance
 func NewPhoreParser(params *chaincfg.Params, c *btc.Configuration) *PhoreParser {
 	return &PhoreParser{
 		BitcoinParser: btc.NewBitcoinParser(params, c),
@@ -108,9 +110,8 @@ func NewPhoreParser(params *chaincfg.Params, c *btc.Configuration) *PhoreParser 
 	}
 }
 
-// GetChainParams contains network parameters for the main Groestlcoin network,
-// the regression test Groestlcoin network, the test Groestlcoin network and
-// the simulation test Groestlcoin network, in this order
+// GetChainParams contains network parameters for the main Phore network,
+// and the test Phore network
 func GetChainParams(chain string) *chaincfg.Params {
 	if !chaincfg.IsRegistered(&MainNetParams) {
 		err := chaincfg.Register(&MainNetParams)
