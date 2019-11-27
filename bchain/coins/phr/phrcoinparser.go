@@ -106,6 +106,8 @@ func init() {
 	TestNetParams.Name = "testPhore"
 	TestNetParams.Net = TestPhoreNet
 	TestNetParams.Bech32HRPSegwit = "tph"
+	TestNetParams.DefaultPort = "11773"
+	TestNetParams.Checkpoints = []chaincfg.Checkpoint{}
 }
 
 // PhoreParser handle
