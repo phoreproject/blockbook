@@ -14,7 +14,7 @@ import (
 const (
 	// MainNet represents the main bitcoin network.
 	MainPhoreNet wire.BitcoinNet = 0x504852   // PHR
-	TestPhoreNet wire.BitcoinNet = 0x54504852 // TPHR
+	TestPhoreNet wire.BitcoinNet = 0x545048   // TPHR
 )
 
 var (
@@ -39,7 +39,7 @@ func newHashFromStr(hexStr string) *chainhash.Hash {
 }
 
 var PhoreMainNetParams = chaincfg.Params{
-	Name:        "mainPhore",
+	Name:        "main",
 	Net:         MainPhoreNet,
 	DefaultPort: "11771",
 	DNSSeeds: []chaincfg.DNSSeed{
@@ -103,11 +103,14 @@ func init() {
 	MainNetParams = PhoreMainNetParams
 
 	TestNetParams = PhoreMainNetParams
-	TestNetParams.Name = "testPhore"
+	TestNetParams.Name = "test"
 	TestNetParams.Net = TestPhoreNet
-	TestNetParams.Bech32HRPSegwit = "tph"
+	TestNetParams.Bech32HRPSegwit = "tp"
 	TestNetParams.DefaultPort = "11773"
 	TestNetParams.Checkpoints = []chaincfg.Checkpoint{}
+	TestNetParams.HDCoinType = 0x80000001
+	TestNetParams.HDPrivateKeyID = [4]byte{0x3a, 0x80, 0x6, 0xa0}
+	TestNetParams.HDPublicKeyID =  [4]byte{0x3a, 0x80, 0x58, 0x37}
 }
 
 // PhoreParser handle
