@@ -4,6 +4,7 @@ package phr
 
 import (
 	"blockbook/bchain"
+	"blockbook/bchain/coins/btc"
 	"encoding/hex"
 	"math/big"
 	"os"

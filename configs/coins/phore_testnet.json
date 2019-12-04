@@ -22,7 +22,7 @@
     "package_name": "backend-phore-testnet",
     "package_revision": "phoreproject",
     "system_user": "phore",
-    "version": "v1.6.3",
+    "version": "1.6.3",
     "binary_url": "https://github.com/phoreproject/Phore/releases/download/v1.6.3/phore-1.6.3-x86_64-linux-gnu.tar.gz",
     "verification_type": "gpg-sha256",
     "verification_source": "",
