@@ -61,7 +61,7 @@ func Test_GetAddrDescFromAddress(t *testing.T) {
 			wantErr: false,
 		},
 	}
-	parser := NewBitcoinParser(GetChainParams("main"), &Configuration{})
+	parser := NewPhoreParser(GetChainParams("main"), &btc.Configuration{})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -125,7 +125,7 @@ func Test_GetAddrDescFromVout(t *testing.T) {
 			wantErr: false,
 		},
 	}
-	parser := NewBitcoinParser(GetChainParams("main"), &Configuration{})
+	parser := NewPhoreParser(GetChainParams("main"), &btc.Configuration{})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -218,7 +218,7 @@ func Test_GetAddressesFromAddrDesc(t *testing.T) {
 		},
 	}
 
-	parser := NewBitcoinParser(GetChainParams("main"), &Configuration{})
+	parser := NewPhoreParser(GetChainParams("main"), &btc.Configuration{})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -322,7 +322,7 @@ func Test_PackTx(t *testing.T) {
 		tx        bchain.Tx
 		height    uint32
 		blockTime int64
-		parser    *BitcoinParser
+		parser    *PhoreParser
 	}
 	tests := []struct {
 		name    string
@@ -336,7 +336,7 @@ func Test_PackTx(t *testing.T) {
 				tx:        testTx1,
 				height:    123456,
 				blockTime: 1519053802,
-				parser:    NewBitcoinParser(GetChainParams("main"), &Configuration{}),
+				parser:    NewPhoreParser(GetChainParams("main"), &btc.Configuration{}),
 			},
 			want:    testTxPacked1,
 			wantErr: false,
@@ -347,7 +347,7 @@ func Test_PackTx(t *testing.T) {
 				tx:        testTx2,
 				height:    510234,
 				blockTime: 1235678901,
-				parser:    NewBitcoinParser(GetChainParams("test"), &Configuration{}),
+				parser:    NewPhoreParser(GetChainParams("test"), &btc.Configuration{}),
 			},
 			want:    testTxPacked2,
 			wantErr: false,
@@ -371,7 +371,7 @@ func Test_PackTx(t *testing.T) {
 func Test_UnpackTx(t *testing.T) {
 	type args struct {
 		packedTx string
-		parser   *BitcoinParser
+		parser   *PhoreParser
 	}
 	tests := []struct {
 		name    string
@@ -384,7 +384,7 @@ func Test_UnpackTx(t *testing.T) {
 			name: "btc-1",
 			args: args{
 				packedTx: testTxPacked1,
-				parser:   NewBitcoinParser(GetChainParams("main"), &Configuration{}),
+				parser:   NewPhoreParser(GetChainParams("main"), &btc.Configuration{}),
 			},
 			want:    &testTx1,
 			want1:   123456,
@@ -394,7 +394,7 @@ func Test_UnpackTx(t *testing.T) {
 			name: "testnet-1",
 			args: args{
 				packedTx: testTxPacked2,
-				parser:   NewBitcoinParser(GetChainParams("test"), &Configuration{}),
+				parser:   NewPhoreParser(GetChainParams("test"), &btc.Configuration{}),
 			},
 			want:    &testTx2,
 			want1:   510234,
