@@ -125,6 +125,8 @@ var PhoreTestNetParams = chaincfg.Params{
 	RelayNonStdTxs: false,
 	Bech32HRPSegwit: "tp",
 
+	AddressMagicLen: 1,
+
 	PubKeyHashAddrID: []byte{0x8B}, // starts with x or y
 	ScriptHashAddrID: []byte{0x13}, // starts with 8 or 9
 	PrivateKeyID:     []byte{0xEF}, // starts with '9' or 'c' (Bitcoin defaults)
