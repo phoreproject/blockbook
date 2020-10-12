@@ -16,6 +16,7 @@ import (
 	"blockbook/bchain/coins/myriad"
 	"blockbook/bchain/coins/namecoin"
 	"blockbook/bchain/coins/phr"
+	"blockbook/bchain/coins/rdd"
 	"blockbook/bchain/coins/vertcoin"
 	"blockbook/bchain/coins/zec"
 	"blockbook/common"
@@ -62,6 +63,8 @@ func init() {
 	BlockChainFactories["Groestlcoin Testnet"] = grs.NewGroestlcoinRPC
 	BlockChainFactories["Phore"] = phr.NewPhoreRPC
 	BlockChainFactories["Phore Testnet"] = phr.NewPhoreRPC
+	BlockChainFactories["Reddcoin"] = rdd.NewReddRPC
+	BlockChainFactories["Reddcoin Testnet"] = rdd.NewReddRPC
 }
 
 // GetCoinNameFromConfig gets coin name and coin shortcut from config file
