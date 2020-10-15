@@ -22,7 +22,7 @@
     "package_name": "backend-reddcoin",
     "package_revision": "satoshilabs-1",
     "system_user": "reddcoin",
-    "version": "v3.0.1",
+    "version": "3.0.1",
     "binary_url": "https://github.com/reddcoin-project/reddcoin/releases/download/v3.0.1/reddcoin-3.0.1-linux.tar.gz",
     "verification_type": "gpg-sha256",
     "verification_source": "https://github.com/reddcoin-project/reddcoin/releases/download/v3.0.1/SHA256SUMS.asc",
