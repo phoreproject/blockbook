@@ -29,6 +29,11 @@
     "extract_command": "tar -C backend --strip 1 -xf",
     "exclude_files": [
       "bin/32",
+      "bin/32/test_reddcoin-qt",
+      "bin/32/test_reddcoin",
+      "bin/32/reddcoin-qt",
+      "bin/32/reddcoin-cli",
+      "bin/32/reddcoind",
       "bin/64/reddcoin-qt",
       "bin/64/test_reddcoin",
       "bin/64/test_reddcoin-qt"
