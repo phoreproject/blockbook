@@ -1,9 +1,9 @@
 {
   "coin": {
-      "name": "Dogecoin",
-      "shortcut": "DOGE",
-      "label": "Dogecoin",
-      "alias": "dogecoin"
+    "name": "Dogecoin",
+    "shortcut": "DOGE",
+    "label": "Dogecoin",
+    "alias": "dogecoin"
   },
   "ports": {
     "backend_rpc": 8038,
@@ -22,14 +22,13 @@
     "package_name": "backend-dogecoin",
     "package_revision": "satoshilabs-1",
     "system_user": "dogecoin",
-    "version": "1.14-alpha-4",
-    "binary_url": "https://doge1.trezor.io/builds/dogecoin-1.14-alpha-4-linux64.tar.gz",
+    "version": "1.14.3",
+    "binary_url": "https://github.com/dogecoin/dogecoin/releases/download/v1.14.3/dogecoin-1.14.3-x86_64-linux-gnu.tar.gz",
     "verification_type": "sha256",
-    "verification_source": "a428d761683707adbf344efe525f5e9a82f88dd7d43d9287209af4ca40297306",
+    "verification_source": "a95cc29ac3c19a450e9083cc3ac24b6f61763d3ed1563bfc3ea9afbf0a2804fd",
     "extract_command": "tar -C backend --strip 1 -xf",
     "exclude_files": [
-        "bin/dogecoin-qt",
-        "bin/test_dogecoin-qt"
+      "bin/dogecoin-qt"
     ],
     "exec_command_template": "{{.Env.BackendInstallPath}}/{{.Coin.Alias}}/bin/dogecoind -datadir={{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend -conf={{.Env.BackendInstallPath}}/{{.Coin.Alias}}/{{.Coin.Alias}}.conf -pid=/run/{{.Coin.Alias}}/{{.Coin.Alias}}.pid",
     "logrotate_files_template": "{{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend/*.log",
@@ -41,10 +40,10 @@
     "server_config_file": "bitcoin_like.conf",
     "client_config_file": "bitcoin_like_client.conf",
     "additional_params": {
-        "whitelist": "127.0.0.1",
-        "rpcthreads": 16,
-        "upnp": 0,
-        "discover": 0
+      "discover": 0,
+      "rpcthreads": 16,
+      "upnp": 0,
+      "whitelist": "127.0.0.1"
     }
   },
   "blockbook": {
@@ -59,11 +58,16 @@
       "mempool_workers": 8,
       "mempool_sub_workers": 2,
       "block_addresses_to_keep": 300,
-      "additional_params": {}
+      "xpub_magic": 49990397,
+      "slip44": 3,
+      "additional_params": {
+        "fiat_rates": "coingecko",
+        "fiat_rates_params": "{\"url\": \"https://api.coingecko.com/api/v3\", \"coin\": \"dogecoin\", \"periodSeconds\": 60}"
+      }
     }
   },
   "meta": {
-    "package_maintainer": "Jakub Matys",
-    "package_maintainer_email": "jakub.matys@satoshilabs.com"
+    "package_maintainer": "IT Admin",
+    "package_maintainer_email": "it@satoshilabs.com"
   }
 }

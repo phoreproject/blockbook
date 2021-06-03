@@ -1,11 +1,11 @@
 package myriad
 
 import (
-	"blockbook/bchain"
-	"blockbook/bchain/coins/btc"
 	"encoding/json"
 
 	"github.com/golang/glog"
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/bchain/coins/btc"
 )
 
 // MyriadRPC is an interface to JSON-RPC bitcoind service.
@@ -31,10 +31,11 @@ func NewMyriadRPC(config json.RawMessage, pushHandler func(bchain.NotificationTy
 
 // Initialize initializes MyriadRPC instance.
 func (b *MyriadRPC) Initialize() error {
-	chainName, err := b.GetChainInfoAndInitializeMempool(b)
+	ci, err := b.GetChainInfo()
 	if err != nil {
 		return err
 	}
+	chainName := ci.Chain
 
 	glog.Info("Chain name ", chainName)
 	params := GetChainParams(chainName)

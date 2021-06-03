@@ -1,6 +1,7 @@
-# initialize from the image
-
-FROM debian:9
+# initialize from the image defined by BASE_IMAGE
+ARG BASE_IMAGE
+FROM $BASE_IMAGE
+ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
     apt-get upgrade -y && \
@@ -9,17 +10,24 @@ RUN apt-get update && \
                        liblz4-dev graphviz && \
     apt-get clean
 
-ENV GOLANG_VERSION=go1.10.linux-amd64
-ENV ROCKSDB_VERSION=v5.15.10
+ENV GOLANG_VERSION=go1.15.5.linux-amd64
+ENV ROCKSDB_VERSION=v6.13.3
 ENV GOPATH=/go
 ENV PATH=$PATH:$GOPATH/bin
 ENV CGO_CFLAGS="-I/opt/rocksdb/include"
-ENV CGO_LDFLAGS="-L/opt/rocksdb -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4"
+ENV CGO_LDFLAGS="-L/opt/rocksdb -ldl -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4"
+ARG TCMALLOC
 
 RUN mkdir /build
 
+RUN if [ -n "${TCMALLOC}" ]; then \
+    echo "Using TCMALLOC"; \
+    apt-get install -y google-perftools; \
+    ln -s /usr/lib/libtcmalloc.so.4 /usr/lib/libtcmalloc.so;\
+fi
+
 # install and configure go
-RUN cd /opt && wget https://storage.googleapis.com/golang/$GOLANG_VERSION.tar.gz && \
+RUN cd /opt && wget https://dl.google.com/go/$GOLANG_VERSION.tar.gz && \
     tar xf $GOLANG_VERSION.tar.gz
 RUN ln -s /opt/go/bin/go /usr/bin/go
 RUN mkdir -p $GOPATH
@@ -33,18 +41,17 @@ RUN strip /opt/rocksdb/ldb /opt/rocksdb/sst_dump && \
     cp /opt/rocksdb/ldb /opt/rocksdb/sst_dump /build
 
 # install build tools
-RUN go get github.com/golang/dep/cmd/dep
 RUN go get github.com/gobuffalo/packr/...
 
-# download pre-loaded depencencies
+# pre-load depencencies
 RUN \
-    cleanup() { rm -rf $GOPATH/src/blockbook; } && \
+    cleanup() { rm -rf $GOPATH/src/github.com/trezor ; } && \
     trap cleanup EXIT && \
-    cd $GOPATH/src && \
+    mkdir -p $GOPATH/src/github.com/trezor && \
+    cd $GOPATH/src/github.com/trezor && \
     git clone https://github.com/phoreproject/blockbook.git && \
     cd blockbook && \
-    dep ensure -vendor-only && \
-    cp -r vendor /build/vendor
+    go mod download
 
 ADD Makefile /build/Makefile
 

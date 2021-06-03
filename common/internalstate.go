@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 )
@@ -25,6 +26,23 @@ type InternalStateColumn struct {
 	Updated    time.Time `json:"updated"`
 }
 
+// BackendInfo is used to get information about blockchain
+type BackendInfo struct {
+	BackendError    string      `json:"error,omitempty"`
+	Chain           string      `json:"chain,omitempty"`
+	Blocks          int         `json:"blocks,omitempty"`
+	Headers         int         `json:"headers,omitempty"`
+	BestBlockHash   string      `json:"bestBlockHash,omitempty"`
+	Difficulty      string      `json:"difficulty,omitempty"`
+	SizeOnDisk      int64       `json:"sizeOnDisk,omitempty"`
+	Version         string      `json:"version,omitempty"`
+	Subversion      string      `json:"subversion,omitempty"`
+	ProtocolVersion string      `json:"protocolVersion,omitempty"`
+	Timeoffset      float64     `json:"timeOffset,omitempty"`
+	Warnings        string      `json:"warnings,omitempty"`
+	Consensus       interface{} `json:"consensus,omitempty"`
+}
+
 // InternalState contains the data of the internal state
 type InternalState struct {
 	mux sync.Mutex
@@ -45,12 +63,17 @@ type InternalState struct {
 	IsSynchronized bool      `json:"isSynchronized"`
 	BestHeight     uint32    `json:"bestHeight"`
 	LastSync       time.Time `json:"lastSync"`
+	BlockTimes     []uint32  `json:"-"`
 
 	IsMempoolSynchronized bool      `json:"isMempoolSynchronized"`
 	MempoolSize           int       `json:"mempoolSize"`
 	LastMempoolSync       time.Time `json:"lastMempoolSync"`
 
 	DbColumns []InternalStateColumn `json:"dbColumns"`
+
+	UtxoChecked bool `json:"utxoChecked"`
+
+	BackendInfo BackendInfo `json:"-"`
 }
 
 // StartedSync signals start of synchronization
@@ -150,9 +173,7 @@ func (is *InternalState) GetDBColumnStatValues(c int) (int64, int64, int64) {
 func (is *InternalState) GetAllDBColumnStats() []InternalStateColumn {
 	is.mux.Lock()
 	defer is.mux.Unlock()
-	rv := make([]InternalStateColumn, len(is.DbColumns))
-	copy(rv, is.DbColumns)
-	return rv
+	return append(is.DbColumns[:0:0], is.DbColumns...)
 }
 
 // DBSizeTotal sums the computed sizes of all columns
@@ -164,6 +185,68 @@ func (is *InternalState) DBSizeTotal() int64 {
 		total += c.KeyBytes + c.ValueBytes
 	}
 	return total
+}
+
+// GetBlockTime returns block time if block found or 0
+func (is *InternalState) GetBlockTime(height uint32) uint32 {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	if int(height) < len(is.BlockTimes) {
+		return is.BlockTimes[height]
+	}
+	return 0
+}
+
+// AppendBlockTime appends block time to BlockTimes
+func (is *InternalState) AppendBlockTime(time uint32) {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	is.BlockTimes = append(is.BlockTimes, time)
+}
+
+// RemoveLastBlockTimes removes last times from BlockTimes
+func (is *InternalState) RemoveLastBlockTimes(count int) {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	if len(is.BlockTimes) < count {
+		count = len(is.BlockTimes)
+	}
+	is.BlockTimes = is.BlockTimes[:len(is.BlockTimes)-count]
+}
+
+// GetBlockHeightOfTime returns block height of the first block with time greater or equal to the given time or MaxUint32 if no such block
+func (is *InternalState) GetBlockHeightOfTime(time uint32) uint32 {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	height := sort.Search(len(is.BlockTimes), func(i int) bool { return time <= is.BlockTimes[i] })
+	if height == len(is.BlockTimes) {
+		return ^uint32(0)
+	}
+	// as the block times can sometimes be out of order try 20 blocks lower to locate a block with the time greater or equal to the given time
+	max, height := height, height-20
+	if height < 0 {
+		height = 0
+	}
+	for ; height <= max; height++ {
+		if time <= is.BlockTimes[height] {
+			break
+		}
+	}
+	return uint32(height)
+}
+
+// SetBackendInfo sets new BackendInfo
+func (is *InternalState) SetBackendInfo(bi *BackendInfo) {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	is.BackendInfo = *bi
+}
+
+// GetBackendInfo gets BackendInfo
+func (is *InternalState) GetBackendInfo() BackendInfo {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	return is.BackendInfo
 }
 
 // Pack marshals internal state to json

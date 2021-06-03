@@ -3,14 +3,15 @@
 package sync
 
 import (
-	"blockbook/bchain"
-	"blockbook/db"
 	"fmt"
 	"math/big"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/db"
 )
 
 func testHandleFork(t *testing.T, h *TestHandler) {
@@ -129,9 +130,12 @@ func verifyTransactions2(t *testing.T, d *db.RocksDB, rng Range, addr2txs map[st
 			checkMap[txid] = false
 		}
 
-		err := d.GetTransactions(addr, rng.Lower, rng.Upper, func(txid string, vout uint32, isOutput bool) error {
-			if isOutput {
-				checkMap[txid] = true
+		err := d.GetTransactions(addr, rng.Lower, rng.Upper, func(txid string, height uint32, indexes []int32) error {
+			for _, index := range indexes {
+				if index >= 0 {
+					checkMap[txid] = true
+					break
+				}
 			}
 			return nil
 		})

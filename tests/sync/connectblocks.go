@@ -3,13 +3,14 @@
 package sync
 
 import (
-	"blockbook/bchain"
-	"blockbook/db"
 	"math/big"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/db"
 )
 
 func testConnectBlocks(t *testing.T, h *TestHandler) {
@@ -25,10 +26,8 @@ func testConnectBlocks(t *testing.T, h *TestHandler) {
 					close(ch)
 				}
 			}, true)
-			if err != nil {
-				if !strings.HasPrefix(err.Error(), "connectBlocks interrupted at height") {
-					t.Fatal(err)
-				}
+			if err != nil && err != db.ErrOperationInterrupted {
+				t.Fatal(err)
 			}
 
 			height, _, err := d.GetBestBlock()
@@ -106,9 +105,8 @@ func verifyBlockInfo(t *testing.T, d *db.RocksDB, h *TestHandler, rng Range) {
 
 func verifyTransactions(t *testing.T, d *db.RocksDB, h *TestHandler, rng Range) {
 	type txInfo struct {
-		txid     string
-		vout     uint32
-		isOutput bool
+		txid  string
+		index int32
 	}
 	addr2txs := make(map[string][]txInfo)
 	checkMap := make(map[string][]bool)
@@ -122,13 +120,13 @@ func verifyTransactions(t *testing.T, d *db.RocksDB, h *TestHandler, rng Range) 
 		for _, tx := range block.TxDetails {
 			for _, vin := range tx.Vin {
 				for _, a := range vin.Addresses {
-					addr2txs[a] = append(addr2txs[a], txInfo{tx.Txid, vin.Vout, false})
+					addr2txs[a] = append(addr2txs[a], txInfo{tx.Txid, ^int32(vin.Vout)})
 					checkMap[a] = append(checkMap[a], false)
 				}
 			}
 			for _, vout := range tx.Vout {
 				for _, a := range vout.ScriptPubKey.Addresses {
-					addr2txs[a] = append(addr2txs[a], txInfo{tx.Txid, vout.N, true})
+					addr2txs[a] = append(addr2txs[a], txInfo{tx.Txid, int32(vout.N)})
 					checkMap[a] = append(checkMap[a], false)
 				}
 			}
@@ -136,10 +134,12 @@ func verifyTransactions(t *testing.T, d *db.RocksDB, h *TestHandler, rng Range) 
 	}
 
 	for addr, txs := range addr2txs {
-		err := d.GetTransactions(addr, rng.Lower, rng.Upper, func(txid string, vout uint32, isOutput bool) error {
+		err := d.GetTransactions(addr, rng.Lower, rng.Upper, func(txid string, height uint32, indexes []int32) error {
 			for i, tx := range txs {
-				if txid == tx.txid && vout == tx.vout && isOutput == tx.isOutput {
-					checkMap[addr][i] = true
+				for _, index := range indexes {
+					if txid == tx.txid && index == tx.index {
+						checkMap[addr][i] = true
+					}
 				}
 			}
 			return nil

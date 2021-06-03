@@ -1,30 +1,63 @@
 package db
 
 import (
-	"blockbook/bchain"
-	"blockbook/common"
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
+	"unsafe"
 
-	"github.com/bsm/go-vlq"
+	vlq "github.com/bsm/go-vlq"
 	"github.com/golang/glog"
 	"github.com/juju/errors"
 	"github.com/tecbot/gorocksdb"
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/common"
 )
+
+const dbVersion = 5
+
+const packedHeightBytes = 4
+const maxAddrDescLen = 1024
 
 // iterator creates snapshot, which takes lots of resources
 // when doing huge scan, it is better to close it and reopen from time to time to free the resources
 const refreshIterator = 5000000
-const packedHeightBytes = 4
-const dbVersion = 3
-const maxAddrDescLen = 1024
+
+// FiatRatesTimeFormat is a format string for storing FiatRates timestamps in rocksdb
+const FiatRatesTimeFormat = "20060102150405" // YYYYMMDDhhmmss
+
+// CurrencyRatesTicker contains coin ticker data fetched from API
+type CurrencyRatesTicker struct {
+	Timestamp *time.Time // return as unix timestamp in API
+	Rates     map[string]float64
+}
+
+// ResultTickerAsString contains formatted CurrencyRatesTicker data
+type ResultTickerAsString struct {
+	Timestamp int64              `json:"ts,omitempty"`
+	Rates     map[string]float64 `json:"rates"`
+	Error     string             `json:"error,omitempty"`
+}
+
+// ResultTickersAsString contains a formatted CurrencyRatesTicker list
+type ResultTickersAsString struct {
+	Tickers []ResultTickerAsString `json:"tickers"`
+}
+
+// ResultTickerListAsString contains formatted data about available currency tickers
+type ResultTickerListAsString struct {
+	Timestamp int64    `json:"ts,omitempty"`
+	Tickers   []string `json:"available_currencies"`
+	Error     string   `json:"error,omitempty"`
+}
 
 // RepairRocksDB calls RocksDb db repair function
 func RepairRocksDB(name string) error {
@@ -39,6 +72,18 @@ type connectBlockStats struct {
 	balancesHit     int
 	balancesMiss    int
 }
+
+// AddressBalanceDetail specifies what data are returned by GetAddressBalance
+type AddressBalanceDetail int
+
+const (
+	// AddressBalanceDetailNoUTXO returns address balance without utxos
+	AddressBalanceDetailNoUTXO = 0
+	// AddressBalanceDetailUTXO returns address balance with utxos
+	AddressBalanceDetailUTXO = 1
+	// addressBalanceDetailUTXOIndexed returns address balance with utxos and index for updates, used only internally
+	addressBalanceDetailUTXOIndexed = 2
+)
 
 // RocksDB handle
 type RocksDB struct {
@@ -59,13 +104,23 @@ const (
 	cfDefault = iota
 	cfHeight
 	cfAddresses
-	cfTxAddresses
-	cfAddressBalance
 	cfBlockTxs
 	cfTransactions
+	cfFiatRates
+	// BitcoinType
+	cfAddressBalance
+	cfTxAddresses
+	// EthereumType
+	cfAddressContracts = cfAddressBalance
 )
 
-var cfNames = []string{"default", "height", "addresses", "txAddresses", "addressBalance", "blockTxs", "transactions"}
+// common columns
+var cfNames []string
+var cfBaseNames = []string{"default", "height", "addresses", "blockTxs", "transactions", "fiatRates"}
+
+// type specific columns
+var cfNamesBitcoinType = []string{"addressBalance", "txAddresses"}
+var cfNamesEthereumType = []string{"addressContracts"}
 
 func openDB(path string, c *gorocksdb.Cache, openFiles int) (*gorocksdb.DB, []*gorocksdb.ColumnFamilyHandle, error) {
 	// opts with bloom filter
@@ -73,9 +128,14 @@ func openDB(path string, c *gorocksdb.Cache, openFiles int) (*gorocksdb.DB, []*g
 	// opts for addresses without bloom filter
 	// from documentation: if most of your queries are executed using iterators, you shouldn't set bloom filter
 	optsAddresses := createAndSetDBOptions(0, c, openFiles)
-	// default, height, addresses, txAddresses, addressBalance, blockTxids, transactions
-	fcOptions := []*gorocksdb.Options{opts, opts, optsAddresses, opts, opts, opts, opts}
-	db, cfh, err := gorocksdb.OpenDbColumnFamilies(opts, path, cfNames, fcOptions)
+	// default, height, addresses, blockTxids, transactions
+	cfOptions := []*gorocksdb.Options{opts, opts, optsAddresses, opts, opts, opts}
+	// append type specific options
+	count := len(cfNames) - len(cfOptions)
+	for i := 0; i < count; i++ {
+		cfOptions = append(cfOptions, opts)
+	}
+	db, cfh, err := gorocksdb.OpenDbColumnFamilies(opts, path, cfNames, cfOptions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -86,7 +146,18 @@ func openDB(path string, c *gorocksdb.Cache, openFiles int) (*gorocksdb.DB, []*g
 // needs to be called to release it.
 func NewRocksDB(path string, cacheSize, maxOpenFiles int, parser bchain.BlockChainParser, metrics *common.Metrics) (d *RocksDB, err error) {
 	glog.Infof("rocksdb: opening %s, required data version %v, cache size %v, max open files %v", path, dbVersion, cacheSize, maxOpenFiles)
-	c := gorocksdb.NewLRUCache(cacheSize)
+
+	cfNames = append([]string{}, cfBaseNames...)
+	chainType := parser.GetChainType()
+	if chainType == bchain.ChainBitcoinType {
+		cfNames = append(cfNames, cfNamesBitcoinType...)
+	} else if chainType == bchain.ChainEthereumType {
+		cfNames = append(cfNames, cfNamesEthereumType...)
+	} else {
+		return nil, errors.New("Unknown chain type")
+	}
+
+	c := gorocksdb.NewLRUCache(uint64(cacheSize))
 	db, cfh, err := openDB(path, c, maxOpenFiles)
 	if err != nil {
 		return nil, err
@@ -103,6 +174,104 @@ func (d *RocksDB) closeDB() error {
 	d.db.Close()
 	d.db = nil
 	return nil
+}
+
+// FiatRatesConvertDate checks if the date is in correct format and returns the Time object.
+// Possible formats are: YYYYMMDDhhmmss, YYYYMMDDhhmm, YYYYMMDDhh, YYYYMMDD
+func FiatRatesConvertDate(date string) (*time.Time, error) {
+	for format := FiatRatesTimeFormat; len(format) >= 8; format = format[:len(format)-2] {
+		convertedDate, err := time.Parse(format, date)
+		if err == nil {
+			return &convertedDate, nil
+		}
+	}
+	msg := "Date \"" + date + "\" does not match any of available formats. "
+	msg += "Possible formats are: YYYYMMDDhhmmss, YYYYMMDDhhmm, YYYYMMDDhh, YYYYMMDD"
+	return nil, errors.New(msg)
+}
+
+// FiatRatesStoreTicker stores ticker data at the specified time
+func (d *RocksDB) FiatRatesStoreTicker(ticker *CurrencyRatesTicker) error {
+	if len(ticker.Rates) == 0 {
+		return errors.New("Error storing ticker: empty rates")
+	} else if ticker.Timestamp == nil {
+		return errors.New("Error storing ticker: empty timestamp")
+	}
+	ratesMarshalled, err := json.Marshal(ticker.Rates)
+	if err != nil {
+		glog.Error("Error marshalling ticker rates: ", err)
+		return err
+	}
+	timeFormatted := ticker.Timestamp.UTC().Format(FiatRatesTimeFormat)
+	err = d.db.PutCF(d.wo, d.cfh[cfFiatRates], []byte(timeFormatted), ratesMarshalled)
+	if err != nil {
+		glog.Error("Error storing ticker: ", err)
+		return err
+	}
+	return nil
+}
+
+// FiatRatesFindTicker gets FiatRates data closest to the specified timestamp
+func (d *RocksDB) FiatRatesFindTicker(tickerTime *time.Time) (*CurrencyRatesTicker, error) {
+	ticker := &CurrencyRatesTicker{}
+	tickerTimeFormatted := tickerTime.UTC().Format(FiatRatesTimeFormat)
+	it := d.db.NewIteratorCF(d.ro, d.cfh[cfFiatRates])
+	defer it.Close()
+
+	for it.Seek([]byte(tickerTimeFormatted)); it.Valid(); it.Next() {
+		timeObj, err := time.Parse(FiatRatesTimeFormat, string(it.Key().Data()))
+		if err != nil {
+			glog.Error("FiatRatesFindTicker time parse error: ", err)
+			return nil, err
+		}
+		timeObj = timeObj.UTC()
+		ticker.Timestamp = &timeObj
+		err = json.Unmarshal(it.Value().Data(), &ticker.Rates)
+		if err != nil {
+			glog.Error("FiatRatesFindTicker error unpacking rates: ", err)
+			return nil, err
+		}
+		break
+	}
+	if err := it.Err(); err != nil {
+		glog.Error("FiatRatesFindTicker Iterator error: ", err)
+		return nil, err
+	}
+	if !it.Valid() {
+		return nil, nil // ticker not found
+	}
+	return ticker, nil
+}
+
+// FiatRatesFindLastTicker gets the last FiatRates record
+func (d *RocksDB) FiatRatesFindLastTicker() (*CurrencyRatesTicker, error) {
+	ticker := &CurrencyRatesTicker{}
+	it := d.db.NewIteratorCF(d.ro, d.cfh[cfFiatRates])
+	defer it.Close()
+
+	for it.SeekToLast(); it.Valid(); it.Next() {
+		timeObj, err := time.Parse(FiatRatesTimeFormat, string(it.Key().Data()))
+		if err != nil {
+			glog.Error("FiatRatesFindTicker time parse error: ", err)
+			return nil, err
+		}
+		timeObj = timeObj.UTC()
+		ticker.Timestamp = &timeObj
+		err = json.Unmarshal(it.Value().Data(), &ticker.Rates)
+		if err != nil {
+			glog.Error("FiatRatesFindTicker error unpacking rates: ", err)
+			return nil, err
+		}
+		break
+	}
+	if err := it.Err(); err != nil {
+		glog.Error("FiatRatesFindLastTicker Iterator error: ", err)
+		return ticker, err
+	}
+	if !it.Valid() {
+		return nil, nil // ticker not found
+	}
+	return ticker, nil
 }
 
 // Close releases the RocksDB environment opened in NewRocksDB.
@@ -139,17 +308,17 @@ func (d *RocksDB) Reopen() error {
 	return nil
 }
 
-func atoi(s string) int {
+func atoUint64(s string) uint64 {
 	i, err := strconv.Atoi(s)
 	if err != nil {
 		return 0
 	}
-	return i
+	return uint64(i)
 }
 
 // GetMemoryStats returns memory usage statistics as reported by RocksDB
 func (d *RocksDB) GetMemoryStats() string {
-	var total, indexAndFilter, memtable int
+	var total, indexAndFilter, memtable uint64
 	type columnStats struct {
 		name           string
 		indexAndFilter string
@@ -160,12 +329,12 @@ func (d *RocksDB) GetMemoryStats() string {
 		cs[i].name = cfNames[i]
 		cs[i].indexAndFilter = d.db.GetPropertyCF("rocksdb.estimate-table-readers-mem", d.cfh[i])
 		cs[i].memtable = d.db.GetPropertyCF("rocksdb.cur-size-all-mem-tables", d.cfh[i])
-		indexAndFilter += atoi(cs[i].indexAndFilter)
-		memtable += atoi(cs[i].memtable)
+		indexAndFilter += atoUint64(cs[i].indexAndFilter)
+		memtable += atoUint64(cs[i].memtable)
 	}
 	m := struct {
-		cacheUsage       int
-		pinnedCacheUsage int
+		cacheUsage       uint64
+		pinnedCacheUsage uint64
 		columns          []columnStats
 	}{
 		cacheUsage:       d.cache.GetUsage(),
@@ -183,9 +352,13 @@ func (e *StopIteration) Error() string {
 	return ""
 }
 
+// GetTransactionsCallback is called by GetTransactions/GetAddrDescTransactions for each found tx
+// indexes contain array of indexes (input negative, output positive) in tx where is given address
+type GetTransactionsCallback func(txid string, height uint32, indexes []int32) error
+
 // GetTransactions finds all input/output transactions for address
 // Transaction are passed to callback function.
-func (d *RocksDB) GetTransactions(address string, lower uint32, higher uint32, fn func(txid string, vout uint32, isOutput bool) error) (err error) {
+func (d *RocksDB) GetTransactions(address string, lower uint32, higher uint32, fn GetTransactionsCallback) (err error) {
 	if glog.V(1) {
 		glog.Infof("rocksdb: address get %s %d-%d ", address, lower, higher)
 	}
@@ -197,47 +370,61 @@ func (d *RocksDB) GetTransactions(address string, lower uint32, higher uint32, f
 }
 
 // GetAddrDescTransactions finds all input/output transactions for address descriptor
-// Transaction are passed to callback function.
-func (d *RocksDB) GetAddrDescTransactions(addrDesc bchain.AddressDescriptor, lower uint32, higher uint32, fn func(txid string, vout uint32, isOutput bool) error) (err error) {
-	kstart := packAddressKey(addrDesc, lower)
-	kstop := packAddressKey(addrDesc, higher)
-
+// Transaction are passed to callback function in the order from newest block to the oldest
+func (d *RocksDB) GetAddrDescTransactions(addrDesc bchain.AddressDescriptor, lower uint32, higher uint32, fn GetTransactionsCallback) (err error) {
+	txidUnpackedLen := d.chainParser.PackedTxidLen()
+	addrDescLen := len(addrDesc)
+	startKey := packAddressKey(addrDesc, higher)
+	stopKey := packAddressKey(addrDesc, lower)
+	indexes := make([]int32, 0, 16)
 	it := d.db.NewIteratorCF(d.ro, d.cfh[cfAddresses])
 	defer it.Close()
-
-	for it.Seek(kstart); it.Valid(); it.Next() {
+	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		val := it.Value().Data()
-		if bytes.Compare(key, kstop) > 0 {
+		if bytes.Compare(key, stopKey) > 0 {
 			break
 		}
-		outpoints, err := d.unpackOutpoints(val)
+		if len(key) != addrDescLen+packedHeightBytes {
+			if glog.V(2) {
+				glog.Warningf("rocksdb: addrDesc %s - mixed with %s", addrDesc, hex.EncodeToString(key))
+			}
+			continue
+		}
+		val := it.Value().Data()
+		if glog.V(2) {
+			glog.Infof("rocksdb: addresses %s: %s", hex.EncodeToString(key), hex.EncodeToString(val))
+		}
+		_, height, err := unpackAddressKey(key)
 		if err != nil {
 			return err
 		}
-		if glog.V(2) {
-			glog.Infof("rocksdb: output %s: %s", hex.EncodeToString(key), hex.EncodeToString(val))
-		}
-		for _, o := range outpoints {
-			var vout uint32
-			var isOutput bool
-			if o.index < 0 {
-				vout = uint32(^o.index)
-				isOutput = false
-			} else {
-				vout = uint32(o.index)
-				isOutput = true
-			}
-			tx, err := d.chainParser.UnpackTxid(o.btxID)
+		for len(val) > txidUnpackedLen {
+			tx, err := d.chainParser.UnpackTxid(val[:txidUnpackedLen])
 			if err != nil {
 				return err
 			}
-			if err := fn(tx, vout, isOutput); err != nil {
+			indexes = indexes[:0]
+			val = val[txidUnpackedLen:]
+			for {
+				index, l := unpackVarint32(val)
+				indexes = append(indexes, index>>1)
+				val = val[l:]
+				if index&1 == 1 {
+					break
+				} else if len(val) == 0 {
+					glog.Warningf("rocksdb: addresses contain incorrect data %s: %s", hex.EncodeToString(key), hex.EncodeToString(val))
+					break
+				}
+			}
+			if err := fn(tx, height, indexes); err != nil {
 				if _, ok := err.(*StopIteration); ok {
 					return nil
 				}
 				return err
 			}
+		}
+		if len(val) != 0 {
+			glog.Warningf("rocksdb: addresses contain incorrect data %s: %s", hex.EncodeToString(key), hex.EncodeToString(val))
 		}
 	}
 	return nil
@@ -250,45 +437,23 @@ const (
 
 // ConnectBlock indexes addresses in the block and stores them in db
 func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
-	return d.writeBlock(block, opInsert)
-}
-
-// DisconnectBlock removes addresses in the block from the db
-func (d *RocksDB) DisconnectBlock(block *bchain.Block) error {
-	return d.writeBlock(block, opDelete)
-}
-
-func (d *RocksDB) writeBlock(block *bchain.Block, op int) error {
 	wb := gorocksdb.NewWriteBatch()
 	defer wb.Destroy()
 
 	if glog.V(2) {
-		switch op {
-		case opInsert:
-			glog.Infof("rocksdb: insert %d %s", block.Height, block.Hash)
-		case opDelete:
-			glog.Infof("rocksdb: delete %d %s", block.Height, block.Hash)
-		}
+		glog.Infof("rocksdb: insert %d %s", block.Height, block.Hash)
 	}
 
-	isUTXO := d.chainParser.IsUTXOChain()
+	chainType := d.chainParser.GetChainType()
 
-	if err := d.writeHeightFromBlock(wb, block, op); err != nil {
+	if err := d.writeHeightFromBlock(wb, block, opInsert); err != nil {
 		return err
 	}
-	if isUTXO {
-		if op == opDelete {
-			// block does not contain mapping tx-> input address, which is necessary to recreate
-			// unspentTxs; therefore it is not possible to DisconnectBlocks this way
-			return errors.New("DisconnectBlock is not supported for UTXO chains")
-		}
-		addresses := make(map[string][]outpoint)
+	addresses := make(addressesMap)
+	if chainType == bchain.ChainBitcoinType {
 		txAddressesMap := make(map[string]*TxAddresses)
 		balances := make(map[string]*AddrBalance)
-		if err := d.processAddressesUTXO(block, addresses, txAddressesMap, balances); err != nil {
-			return err
-		}
-		if err := d.storeAddresses(wb, block.Height, addresses); err != nil {
+		if err := d.processAddressesBitcoinType(block, addresses, txAddressesMap, balances); err != nil {
 			return err
 		}
 		if err := d.storeTxAddresses(wb, txAddressesMap); err != nil {
@@ -300,57 +465,194 @@ func (d *RocksDB) writeBlock(block *bchain.Block, op int) error {
 		if err := d.storeAndCleanupBlockTxs(wb, block); err != nil {
 			return err
 		}
-	} else {
-		if err := d.writeAddressesNonUTXO(wb, block, op); err != nil {
+	} else if chainType == bchain.ChainEthereumType {
+		addressContracts := make(map[string]*AddrContracts)
+		blockTxs, err := d.processAddressesEthereumType(block, addresses, addressContracts)
+		if err != nil {
 			return err
 		}
+		if err := d.storeAddressContracts(wb, addressContracts); err != nil {
+			return err
+		}
+		if err := d.storeAndCleanupBlockTxsEthereumType(wb, block, blockTxs); err != nil {
+			return err
+		}
+	} else {
+		return errors.New("Unknown chain type")
 	}
-
-	return d.db.Write(d.wo, wb)
+	if err := d.storeAddresses(wb, block.Height, addresses); err != nil {
+		return err
+	}
+	if err := d.db.Write(d.wo, wb); err != nil {
+		return err
+	}
+	d.is.AppendBlockTime(uint32(block.Time))
+	return nil
 }
 
 // Addresses index
+
+type txIndexes struct {
+	btxID   []byte
+	indexes []int32
+}
+
+// addressesMap is a map of addresses in a block
+// each address contains a slice of transactions with indexes where the address appears
+// slice is used instead of map so that order is defined and also search in case of few items
+type addressesMap map[string][]txIndexes
 
 type outpoint struct {
 	btxID []byte
 	index int32
 }
 
+// TxInput holds input data of the transaction in TxAddresses
 type TxInput struct {
 	AddrDesc bchain.AddressDescriptor
 	ValueSat big.Int
 }
 
+// Addresses converts AddressDescriptor of the input to array of strings
 func (ti *TxInput) Addresses(p bchain.BlockChainParser) ([]string, bool, error) {
 	return p.GetAddressesFromAddrDesc(ti.AddrDesc)
 }
 
+// TxOutput holds output data of the transaction in TxAddresses
 type TxOutput struct {
 	AddrDesc bchain.AddressDescriptor
 	Spent    bool
 	ValueSat big.Int
 }
 
+// Addresses converts AddressDescriptor of the output to array of strings
 func (to *TxOutput) Addresses(p bchain.BlockChainParser) ([]string, bool, error) {
 	return p.GetAddressesFromAddrDesc(to.AddrDesc)
 }
 
+// TxAddresses stores transaction inputs and outputs with amounts
 type TxAddresses struct {
 	Height  uint32
 	Inputs  []TxInput
 	Outputs []TxOutput
 }
 
+// Utxo holds information about unspent transaction output
+type Utxo struct {
+	BtxID    []byte
+	Vout     int32
+	Height   uint32
+	ValueSat big.Int
+}
+
+// AddrBalance stores number of transactions and balances of an address
 type AddrBalance struct {
 	Txs        uint32
 	SentSat    big.Int
 	BalanceSat big.Int
+	Utxos      []Utxo
+	utxosMap   map[string]int
 }
 
+// ReceivedSat computes received amount from total balance and sent amount
 func (ab *AddrBalance) ReceivedSat() *big.Int {
 	var r big.Int
 	r.Add(&ab.BalanceSat, &ab.SentSat)
 	return &r
+}
+
+// addUtxo
+func (ab *AddrBalance) addUtxo(u *Utxo) {
+	ab.Utxos = append(ab.Utxos, *u)
+	ab.manageUtxoMap(u)
+}
+
+func (ab *AddrBalance) manageUtxoMap(u *Utxo) {
+	l := len(ab.Utxos)
+	if l >= 16 {
+		if len(ab.utxosMap) == 0 {
+			ab.utxosMap = make(map[string]int, 32)
+			for i := 0; i < l; i++ {
+				s := string(ab.Utxos[i].BtxID)
+				if _, e := ab.utxosMap[s]; !e {
+					ab.utxosMap[s] = i
+				}
+			}
+		} else {
+			s := string(u.BtxID)
+			if _, e := ab.utxosMap[s]; !e {
+				ab.utxosMap[s] = l - 1
+			}
+		}
+	}
+}
+
+// on disconnect, the added utxos must be inserted in the right position so that utxosMap index works
+func (ab *AddrBalance) addUtxoInDisconnect(u *Utxo) {
+	insert := -1
+	if len(ab.utxosMap) > 0 {
+		if i, e := ab.utxosMap[string(u.BtxID)]; e {
+			insert = i
+		}
+	} else {
+		for i := range ab.Utxos {
+			utxo := &ab.Utxos[i]
+			if *(*int)(unsafe.Pointer(&utxo.BtxID[0])) == *(*int)(unsafe.Pointer(&u.BtxID[0])) && bytes.Equal(utxo.BtxID, u.BtxID) {
+				insert = i
+				break
+			}
+		}
+	}
+	if insert > -1 {
+		// check if it is necessary to insert the utxo into the array
+		for i := insert; i < len(ab.Utxos); i++ {
+			utxo := &ab.Utxos[i]
+			// either the vout is greater than the inserted vout or it is a different tx
+			if utxo.Vout > u.Vout || *(*int)(unsafe.Pointer(&utxo.BtxID[0])) != *(*int)(unsafe.Pointer(&u.BtxID[0])) || !bytes.Equal(utxo.BtxID, u.BtxID) {
+				// found the right place, insert the utxo
+				ab.Utxos = append(ab.Utxos, *u)
+				copy(ab.Utxos[i+1:], ab.Utxos[i:])
+				ab.Utxos[i] = *u
+				// reset utxosMap after insert, the index will have to be rebuilt if needed
+				ab.utxosMap = nil
+				return
+			}
+		}
+	}
+	ab.Utxos = append(ab.Utxos, *u)
+	ab.manageUtxoMap(u)
+}
+
+// markUtxoAsSpent finds outpoint btxID:vout in utxos and marks it as spent
+// for small number of utxos the linear search is done, for larger number there is a hashmap index
+// it is much faster than removing the utxo from the slice as it would cause in memory reallocations
+func (ab *AddrBalance) markUtxoAsSpent(btxID []byte, vout int32) {
+	if len(ab.utxosMap) == 0 {
+		for i := range ab.Utxos {
+			utxo := &ab.Utxos[i]
+			if utxo.Vout == vout && *(*int)(unsafe.Pointer(&utxo.BtxID[0])) == *(*int)(unsafe.Pointer(&btxID[0])) && bytes.Equal(utxo.BtxID, btxID) {
+				// mark utxo as spent by setting vout=-1
+				utxo.Vout = -1
+				return
+			}
+		}
+	} else {
+		if i, e := ab.utxosMap[string(btxID)]; e {
+			l := len(ab.Utxos)
+			for ; i < l; i++ {
+				utxo := &ab.Utxos[i]
+				if utxo.Vout == vout {
+					if bytes.Equal(utxo.BtxID, btxID) {
+						// mark utxo as spent by setting vout=-1
+						utxo.Vout = -1
+						return
+					}
+					break
+				}
+			}
+		}
+	}
+	glog.Errorf("Utxo %s:%d not found, utxosMap size %d", hex.EncodeToString(btxID), vout, len(ab.utxosMap))
 }
 
 type blockTxs struct {
@@ -375,10 +677,10 @@ func (d *RocksDB) GetAndResetConnectBlockStats() string {
 	return s
 }
 
-func (d *RocksDB) processAddressesUTXO(block *bchain.Block, addresses map[string][]outpoint, txAddressesMap map[string]*TxAddresses, balances map[string]*AddrBalance) error {
+func (d *RocksDB) processAddressesBitcoinType(block *bchain.Block, addresses addressesMap, txAddressesMap map[string]*TxAddresses, balances map[string]*AddrBalance) error {
 	blockTxIDs := make([][]byte, len(block.Txs))
 	blockTxAddresses := make([]*TxAddresses, len(block.Txs))
-	// first process all outputs so that inputs can point to txs in this block
+	// first process all outputs so that inputs can refer to txs in this block
 	for txi := range block.Txs {
 		tx := &block.Txs[txi]
 		btxID, err := d.chainParser.PackTxid(tx.Txid)
@@ -398,44 +700,42 @@ func (d *RocksDB) processAddressesUTXO(block *bchain.Block, addresses map[string
 				if err != nil {
 					// do not log ErrAddressMissing, transactions can be without to address (for example eth contracts)
 					if err != bchain.ErrAddressMissing {
-						glog.Warningf("rocksdb: addrDesc: %v - height %d, tx %v, output %v", err, block.Height, tx.Txid, output)
+						glog.Warningf("rocksdb: addrDesc: %v - height %d, tx %v, output %v, error %v", err, block.Height, tx.Txid, output, err)
 					}
 				} else {
-					glog.Infof("rocksdb: height %d, tx %v, vout %v, skipping addrDesc of length %d", block.Height, tx.Txid, i, len(addrDesc))
+					glog.V(1).Infof("rocksdb: height %d, tx %v, vout %v, skipping addrDesc of length %d", block.Height, tx.Txid, i, len(addrDesc))
 				}
 				continue
 			}
 			tao.AddrDesc = addrDesc
-			strAddrDesc := string(addrDesc)
-			// check that the address was used already in this block
-			o, processed := addresses[strAddrDesc]
-			if processed {
-				// check that the address was already used in this tx
-				processed = processedInTx(o, btxID)
-			}
-			addresses[strAddrDesc] = append(o, outpoint{
-				btxID: btxID,
-				index: int32(i),
-			})
-			ab, e := balances[strAddrDesc]
-			if !e {
-				ab, err = d.GetAddrDescBalance(addrDesc)
-				if err != nil {
-					return err
+			if d.chainParser.IsAddrDescIndexable(addrDesc) {
+				strAddrDesc := string(addrDesc)
+				balance, e := balances[strAddrDesc]
+				if !e {
+					balance, err = d.GetAddrDescBalance(addrDesc, addressBalanceDetailUTXOIndexed)
+					if err != nil {
+						return err
+					}
+					if balance == nil {
+						balance = &AddrBalance{}
+					}
+					balances[strAddrDesc] = balance
+					d.cbs.balancesMiss++
+				} else {
+					d.cbs.balancesHit++
 				}
-				if ab == nil {
-					ab = &AddrBalance{}
+				balance.BalanceSat.Add(&balance.BalanceSat, &output.ValueSat)
+				balance.addUtxo(&Utxo{
+					BtxID:    btxID,
+					Vout:     int32(i),
+					Height:   block.Height,
+					ValueSat: output.ValueSat,
+				})
+				counted := addToAddressesMap(addresses, strAddrDesc, btxID, int32(i))
+				if !counted {
+					balance.Txs++
 				}
-				balances[strAddrDesc] = ab
-				d.cbs.balancesMiss++
-			} else {
-				d.cbs.balancesHit++
 			}
-			// add number of trx in balance only once, address can be multiple times in tx
-			if !processed {
-				ab.Txs++
-			}
-			ab.BalanceSat.Add(&ab.BalanceSat, &output.ValueSat)
 		}
 	}
 	// process inputs
@@ -463,7 +763,8 @@ func (d *RocksDB) processAddressesUTXO(block *bchain.Block, addresses map[string
 					return err
 				}
 				if ita == nil {
-					glog.Warningf("rocksdb: height %d, tx %v, input tx %v not found in txAddresses", block.Height, tx.Txid, input.Txid)
+					// allow parser to process unknown input, some coins may implement special handling, default is to log warning
+					tai.AddrDesc = d.chainParser.GetAddrDescForUnknownInput(tx, i)
 					continue
 				}
 				txAddressesMap[stxID] = ita
@@ -475,74 +776,81 @@ func (d *RocksDB) processAddressesUTXO(block *bchain.Block, addresses map[string
 				glog.Warningf("rocksdb: height %d, tx %v, input tx %v vout %v is out of bounds of stored tx", block.Height, tx.Txid, input.Txid, input.Vout)
 				continue
 			}
-			ot := &ita.Outputs[int(input.Vout)]
-			if ot.Spent {
+			spentOutput := &ita.Outputs[int(input.Vout)]
+			if spentOutput.Spent {
 				glog.Warningf("rocksdb: height %d, tx %v, input tx %v vout %v is double spend", block.Height, tx.Txid, input.Txid, input.Vout)
 			}
-			tai.AddrDesc = ot.AddrDesc
-			tai.ValueSat = ot.ValueSat
+			tai.AddrDesc = spentOutput.AddrDesc
+			tai.ValueSat = spentOutput.ValueSat
 			// mark the output as spent in tx
-			ot.Spent = true
-			if len(ot.AddrDesc) == 0 {
+			spentOutput.Spent = true
+			if len(spentOutput.AddrDesc) == 0 {
 				if !logged {
-					glog.Warningf("rocksdb: height %d, tx %v, input tx %v vout %v skipping empty address", block.Height, tx.Txid, input.Txid, input.Vout)
+					glog.V(1).Infof("rocksdb: height %d, tx %v, input tx %v vout %v skipping empty address", block.Height, tx.Txid, input.Txid, input.Vout)
 					logged = true
 				}
 				continue
 			}
-			strAddrDesc := string(ot.AddrDesc)
-			// check that the address was used already in this block
-			o, processed := addresses[strAddrDesc]
-			if processed {
-				// check that the address was already used in this tx
-				processed = processedInTx(o, spendingTxid)
-			}
-			addresses[strAddrDesc] = append(o, outpoint{
-				btxID: spendingTxid,
-				index: ^int32(i),
-			})
-			ab, e := balances[strAddrDesc]
-			if !e {
-				ab, err = d.GetAddrDescBalance(ot.AddrDesc)
-				if err != nil {
-					return err
+			if d.chainParser.IsAddrDescIndexable(spentOutput.AddrDesc) {
+				strAddrDesc := string(spentOutput.AddrDesc)
+				balance, e := balances[strAddrDesc]
+				if !e {
+					balance, err = d.GetAddrDescBalance(spentOutput.AddrDesc, addressBalanceDetailUTXOIndexed)
+					if err != nil {
+						return err
+					}
+					if balance == nil {
+						balance = &AddrBalance{}
+					}
+					balances[strAddrDesc] = balance
+					d.cbs.balancesMiss++
+				} else {
+					d.cbs.balancesHit++
 				}
-				if ab == nil {
-					ab = &AddrBalance{}
+				counted := addToAddressesMap(addresses, strAddrDesc, spendingTxid, ^int32(i))
+				if !counted {
+					balance.Txs++
 				}
-				balances[strAddrDesc] = ab
-				d.cbs.balancesMiss++
-			} else {
-				d.cbs.balancesHit++
+				balance.BalanceSat.Sub(&balance.BalanceSat, &spentOutput.ValueSat)
+				balance.markUtxoAsSpent(btxID, int32(input.Vout))
+				if balance.BalanceSat.Sign() < 0 {
+					d.resetValueSatToZero(&balance.BalanceSat, spentOutput.AddrDesc, "balance")
+				}
+				balance.SentSat.Add(&balance.SentSat, &spentOutput.ValueSat)
 			}
-			// add number of trx in balance only once, address can be multiple times in tx
-			if !processed {
-				ab.Txs++
-			}
-			ab.BalanceSat.Sub(&ab.BalanceSat, &ot.ValueSat)
-			if ab.BalanceSat.Sign() < 0 {
-				d.resetValueSatToZero(&ab.BalanceSat, ot.AddrDesc, "balance")
-			}
-			ab.SentSat.Add(&ab.SentSat, &ot.ValueSat)
 		}
 	}
 	return nil
 }
 
-func processedInTx(o []outpoint, btxID []byte) bool {
-	for _, op := range o {
-		if bytes.Equal(btxID, op.btxID) {
-			return true
+// addToAddressesMap maintains mapping between addresses and transactions in one block
+// the method assumes that outputs in the block are processed before the inputs
+// the return value is true if the tx was processed before, to not to count the tx multiple times
+func addToAddressesMap(addresses addressesMap, strAddrDesc string, btxID []byte, index int32) bool {
+	// check that the address was already processed in this block
+	// if not found, it has certainly not been counted
+	at, found := addresses[strAddrDesc]
+	if found {
+		// if the tx is already in the slice, append the index to the array of indexes
+		for i, t := range at {
+			if bytes.Equal(btxID, t.btxID) {
+				at[i].indexes = append(t.indexes, index)
+				return true
+			}
 		}
 	}
+	addresses[strAddrDesc] = append(at, txIndexes{
+		btxID:   btxID,
+		indexes: []int32{index},
+	})
 	return false
 }
 
-func (d *RocksDB) storeAddresses(wb *gorocksdb.WriteBatch, height uint32, addresses map[string][]outpoint) error {
-	for addrDesc, outpoints := range addresses {
+func (d *RocksDB) storeAddresses(wb *gorocksdb.WriteBatch, height uint32, addresses addressesMap) error {
+	for addrDesc, txi := range addresses {
 		ba := bchain.AddressDescriptor(addrDesc)
 		key := packAddressKey(ba, height)
-		val := d.packOutpoints(outpoints)
+		val := d.packTxIndexes(txi)
 		wb.PutCF(d.cfh[cfAddresses], key, val)
 	}
 	return nil
@@ -559,19 +867,37 @@ func (d *RocksDB) storeTxAddresses(wb *gorocksdb.WriteBatch, am map[string]*TxAd
 }
 
 func (d *RocksDB) storeBalances(wb *gorocksdb.WriteBatch, abm map[string]*AddrBalance) error {
-	// allocate buffer big enough for number of txs + 2 bigints
-	buf := make([]byte, vlq.MaxLen32+2*maxPackedBigintBytes)
+	// allocate buffer initial buffer
+	buf := make([]byte, 1024)
+	varBuf := make([]byte, maxPackedBigintBytes)
 	for addrDesc, ab := range abm {
-		// balance with 0 transactions is removed from db - happens in disconnect
+		// balance with 0 transactions is removed from db - happens on disconnect
 		if ab == nil || ab.Txs <= 0 {
 			wb.DeleteCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc))
 		} else {
-			l := packVaruint(uint(ab.Txs), buf)
-			ll := packBigint(&ab.SentSat, buf[l:])
-			l += ll
-			ll = packBigint(&ab.BalanceSat, buf[l:])
-			l += ll
-			wb.PutCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc), buf[:l])
+			buf = packAddrBalance(ab, buf, varBuf)
+			wb.PutCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc), buf)
+		}
+	}
+	return nil
+}
+
+func (d *RocksDB) cleanupBlockTxs(wb *gorocksdb.WriteBatch, block *bchain.Block) error {
+	keep := d.chainParser.KeepBlockAddresses()
+	// cleanup old block address
+	if block.Height > uint32(keep) {
+		for rh := block.Height - uint32(keep); rh > 0; rh-- {
+			key := packUint(rh)
+			val, err := d.db.GetCF(d.ro, d.cfh[cfBlockTxs], key)
+			if err != nil {
+				return err
+			}
+			// nil data means the key was not found in DB
+			if val.Data() == nil {
+				break
+			}
+			val.Free()
+			d.db.DeleteCF(d.wo, d.cfh[cfBlockTxs], key)
 		}
 	}
 	return nil
@@ -610,23 +936,7 @@ func (d *RocksDB) storeAndCleanupBlockTxs(wb *gorocksdb.WriteBatch, block *bchai
 	}
 	key := packUint(block.Height)
 	wb.PutCF(d.cfh[cfBlockTxs], key, buf)
-	keep := d.chainParser.KeepBlockAddresses()
-	// cleanup old block address
-	if block.Height > uint32(keep) {
-		for rh := block.Height - uint32(keep); rh < block.Height; rh-- {
-			key = packUint(rh)
-			val, err := d.db.GetCF(d.ro, d.cfh[cfBlockTxs], key)
-			if err != nil {
-				return err
-			}
-			if val.Size() == 0 {
-				break
-			}
-			val.Free()
-			d.db.DeleteCF(d.wo, d.cfh[cfBlockTxs], key)
-		}
-	}
-	return nil
+	return d.cleanupBlockTxs(wb, block)
 }
 
 func (d *RocksDB) getBlockTxs(height uint32) ([]blockTxs, error) {
@@ -643,8 +953,7 @@ func (d *RocksDB) getBlockTxs(height uint32) ([]blockTxs, error) {
 			glog.Error("rocksdb: Inconsistent data in blockTxs ", hex.EncodeToString(buf))
 			return nil, errors.New("Inconsistent data in blockTxs")
 		}
-		txid := make([]byte, pl)
-		copy(txid, buf[i:])
+		txid := append([]byte(nil), buf[i:i+pl]...)
 		i += pl
 		o, ol, err := d.unpackNOutpoints(buf[i:])
 		if err != nil {
@@ -661,7 +970,7 @@ func (d *RocksDB) getBlockTxs(height uint32) ([]blockTxs, error) {
 }
 
 // GetAddrDescBalance returns AddrBalance for given addrDesc
-func (d *RocksDB) GetAddrDescBalance(addrDesc bchain.AddressDescriptor) (*AddrBalance, error) {
+func (d *RocksDB) GetAddrDescBalance(addrDesc bchain.AddressDescriptor, detail AddressBalanceDetail) (*AddrBalance, error) {
 	val, err := d.db.GetCF(d.ro, d.cfh[cfAddressBalance], addrDesc)
 	if err != nil {
 		return nil, err
@@ -672,23 +981,16 @@ func (d *RocksDB) GetAddrDescBalance(addrDesc bchain.AddressDescriptor) (*AddrBa
 	if len(buf) < 3 {
 		return nil, nil
 	}
-	txs, l := unpackVaruint(buf)
-	sentSat, sl := unpackBigint(buf[l:])
-	balanceSat, _ := unpackBigint(buf[l+sl:])
-	return &AddrBalance{
-		Txs:        uint32(txs),
-		SentSat:    sentSat,
-		BalanceSat: balanceSat,
-	}, nil
+	return unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), detail)
 }
 
 // GetAddressBalance returns address balance for an address or nil if address not found
-func (d *RocksDB) GetAddressBalance(address string) (*AddrBalance, error) {
+func (d *RocksDB) GetAddressBalance(address string, detail AddressBalanceDetail) (*AddrBalance, error) {
 	addrDesc, err := d.chainParser.GetAddrDescFromAddress(address)
 	if err != nil {
 		return nil, err
 	}
-	return d.GetAddrDescBalance(addrDesc)
+	return d.GetAddrDescBalance(addrDesc, detail)
 }
 
 func (d *RocksDB) getTxAddresses(btxID []byte) (*TxAddresses, error) {
@@ -712,6 +1014,25 @@ func (d *RocksDB) GetTxAddresses(txid string) (*TxAddresses, error) {
 		return nil, err
 	}
 	return d.getTxAddresses(btxID)
+}
+
+// AddrDescForOutpoint is a function that returns address descriptor and value for given outpoint or nil if outpoint not found
+func (d *RocksDB) AddrDescForOutpoint(outpoint bchain.Outpoint) (bchain.AddressDescriptor, *big.Int) {
+	ta, err := d.GetTxAddresses(outpoint.Txid)
+	if err != nil || ta == nil {
+		return nil, nil
+	}
+	if outpoint.Vout < 0 {
+		vin := ^outpoint.Vout
+		if len(ta.Inputs) <= int(vin) {
+			return nil, nil
+		}
+		return ta.Inputs[vin].AddrDesc, &ta.Inputs[vin].ValueSat
+	}
+	if len(ta.Outputs) <= int(outpoint.Vout) {
+		return nil, nil
+	}
+	return ta.Outputs[outpoint.Vout].AddrDesc, &ta.Outputs[outpoint.Vout].ValueSat
 }
 
 func packTxAddresses(ta *TxAddresses, buf []byte, varBuf []byte) []byte {
@@ -754,6 +1075,68 @@ func appendTxOutput(txo *TxOutput, buf []byte, varBuf []byte) []byte {
 	return buf
 }
 
+func unpackAddrBalance(buf []byte, txidUnpackedLen int, detail AddressBalanceDetail) (*AddrBalance, error) {
+	txs, l := unpackVaruint(buf)
+	sentSat, sl := unpackBigint(buf[l:])
+	balanceSat, bl := unpackBigint(buf[l+sl:])
+	l = l + sl + bl
+	ab := &AddrBalance{
+		Txs:        uint32(txs),
+		SentSat:    sentSat,
+		BalanceSat: balanceSat,
+	}
+	if detail != AddressBalanceDetailNoUTXO {
+		// estimate the size of utxos to avoid reallocation
+		ab.Utxos = make([]Utxo, 0, len(buf[l:])/txidUnpackedLen+3)
+		// ab.utxosMap = make(map[string]int, cap(ab.Utxos))
+		for len(buf[l:]) >= txidUnpackedLen+3 {
+			btxID := append([]byte(nil), buf[l:l+txidUnpackedLen]...)
+			l += txidUnpackedLen
+			vout, ll := unpackVaruint(buf[l:])
+			l += ll
+			height, ll := unpackVaruint(buf[l:])
+			l += ll
+			valueSat, ll := unpackBigint(buf[l:])
+			l += ll
+			u := Utxo{
+				BtxID:    btxID,
+				Vout:     int32(vout),
+				Height:   uint32(height),
+				ValueSat: valueSat,
+			}
+			if detail == AddressBalanceDetailUTXO {
+				ab.Utxos = append(ab.Utxos, u)
+			} else {
+				ab.addUtxo(&u)
+			}
+		}
+	}
+	return ab, nil
+}
+
+func packAddrBalance(ab *AddrBalance, buf, varBuf []byte) []byte {
+	buf = buf[:0]
+	l := packVaruint(uint(ab.Txs), varBuf)
+	buf = append(buf, varBuf[:l]...)
+	l = packBigint(&ab.SentSat, varBuf)
+	buf = append(buf, varBuf[:l]...)
+	l = packBigint(&ab.BalanceSat, varBuf)
+	buf = append(buf, varBuf[:l]...)
+	for _, utxo := range ab.Utxos {
+		// if Vout < 0, utxo is marked as spent
+		if utxo.Vout >= 0 {
+			buf = append(buf, utxo.BtxID...)
+			l = packVaruint(uint(utxo.Vout), varBuf)
+			buf = append(buf, varBuf[:l]...)
+			l = packVaruint(uint(utxo.Height), varBuf)
+			buf = append(buf, varBuf[:l]...)
+			l = packBigint(&utxo.ValueSat, varBuf)
+			buf = append(buf, varBuf[:l]...)
+		}
+	}
+	return buf
+}
+
 func unpackTxAddresses(buf []byte) (*TxAddresses, error) {
 	ta := TxAddresses{}
 	height, l := unpackVaruint(buf)
@@ -775,8 +1158,7 @@ func unpackTxAddresses(buf []byte) (*TxAddresses, error) {
 
 func unpackTxInput(ti *TxInput, buf []byte) int {
 	al, l := unpackVaruint(buf)
-	ti.AddrDesc = make([]byte, al)
-	copy(ti.AddrDesc, buf[l:l+int(al)])
+	ti.AddrDesc = append([]byte(nil), buf[l:l+int(al)]...)
 	al += uint(l)
 	ti.ValueSat, l = unpackBigint(buf[al:])
 	return l + int(al)
@@ -788,11 +1170,29 @@ func unpackTxOutput(to *TxOutput, buf []byte) int {
 		to.Spent = true
 		al = ^al
 	}
-	to.AddrDesc = make([]byte, al)
-	copy(to.AddrDesc, buf[l:l+al])
+	to.AddrDesc = append([]byte(nil), buf[l:l+al]...)
 	al += l
 	to.ValueSat, l = unpackBigint(buf[al:])
 	return l + al
+}
+
+func (d *RocksDB) packTxIndexes(txi []txIndexes) []byte {
+	buf := make([]byte, 0, 32)
+	bvout := make([]byte, vlq.MaxLen32)
+	// store the txs in reverse order for ordering from newest to oldest
+	for j := len(txi) - 1; j >= 0; j-- {
+		t := &txi[j]
+		buf = append(buf, []byte(t.btxID)...)
+		for i, index := range t.indexes {
+			index <<= 1
+			if i == len(t.indexes)-1 {
+				index |= 1
+			}
+			l := packVarint32(index, bvout)
+			buf = append(buf, bvout[:l]...)
+		}
+	}
+	return buf
 }
 
 func (d *RocksDB) packOutpoints(outpoints []outpoint) []byte {
@@ -804,22 +1204,6 @@ func (d *RocksDB) packOutpoints(outpoints []outpoint) []byte {
 		buf = append(buf, bvout[:l]...)
 	}
 	return buf
-}
-
-func (d *RocksDB) unpackOutpoints(buf []byte) ([]outpoint, error) {
-	txidUnpackedLen := d.chainParser.PackedTxidLen()
-	outpoints := make([]outpoint, 0, 8)
-	for i := 0; i < len(buf); {
-		btxID := append([]byte(nil), buf[i:i+txidUnpackedLen]...)
-		i += txidUnpackedLen
-		vout, voutLen := unpackVarint32(buf[i:])
-		i += voutLen
-		outpoints = append(outpoints, outpoint{
-			btxID: btxID,
-			index: vout,
-		})
-	}
-	return outpoints, nil
 }
 
 func (d *RocksDB) unpackNOutpoints(buf []byte) ([]outpoint, int, error) {
@@ -842,74 +1226,6 @@ func (d *RocksDB) unpackNOutpoints(buf []byte) ([]outpoint, int, error) {
 	return outpoints, p, nil
 }
 
-func (d *RocksDB) addAddrDescToRecords(op int, wb *gorocksdb.WriteBatch, records map[string][]outpoint, addrDesc bchain.AddressDescriptor, btxid []byte, vout int32, bh uint32) error {
-	if len(addrDesc) > 0 {
-		if len(addrDesc) > maxAddrDescLen {
-			glog.Infof("rocksdb: block %d, skipping addrDesc of length %d", bh, len(addrDesc))
-		} else {
-			strAddrDesc := string(addrDesc)
-			records[strAddrDesc] = append(records[strAddrDesc], outpoint{
-				btxID: btxid,
-				index: vout,
-			})
-			if op == opDelete {
-				// remove transactions from cache
-				d.internalDeleteTx(wb, btxid)
-			}
-		}
-	}
-	return nil
-}
-
-func (d *RocksDB) writeAddressesNonUTXO(wb *gorocksdb.WriteBatch, block *bchain.Block, op int) error {
-	addresses := make(map[string][]outpoint)
-	for _, tx := range block.Txs {
-		btxID, err := d.chainParser.PackTxid(tx.Txid)
-		if err != nil {
-			return err
-		}
-		for _, output := range tx.Vout {
-			addrDesc, err := d.chainParser.GetAddrDescFromVout(&output)
-			if err != nil {
-				// do not log ErrAddressMissing, transactions can be without to address (for example eth contracts)
-				if err != bchain.ErrAddressMissing {
-					glog.Warningf("rocksdb: addrDesc: %v - height %d, tx %v, output %v", err, block.Height, tx.Txid, output)
-				}
-				continue
-			}
-			err = d.addAddrDescToRecords(op, wb, addresses, addrDesc, btxID, int32(output.N), block.Height)
-			if err != nil {
-				return err
-			}
-		}
-		// store inputs in format txid ^index
-		for _, input := range tx.Vin {
-			for i, a := range input.Addresses {
-				addrDesc, err := d.chainParser.GetAddrDescFromAddress(a)
-				if err != nil {
-					glog.Warningf("rocksdb: addrDesc: %v - %d %s", err, block.Height, addrDesc)
-					continue
-				}
-				err = d.addAddrDescToRecords(op, wb, addresses, addrDesc, btxID, int32(^i), block.Height)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	for addrDesc, outpoints := range addresses {
-		key := packAddressKey(bchain.AddressDescriptor(addrDesc), block.Height)
-		switch op {
-		case opInsert:
-			val := d.packOutpoints(outpoints)
-			wb.PutCF(d.cfh[cfAddresses], key, val)
-		case opDelete:
-			wb.DeleteCF(d.cfh[cfAddresses], key)
-		}
-	}
-	return nil
-}
-
 // Block index
 
 // BlockInfo holds information about blocks kept in column height
@@ -927,6 +1243,15 @@ func (d *RocksDB) packBlockInfo(block *BlockInfo) ([]byte, error) {
 	b, err := d.chainParser.PackBlockHash(block.Hash)
 	if err != nil {
 		return nil, err
+	}
+	pl := d.chainParser.PackedTxidLen()
+	if len(b) != pl {
+		glog.Warning("Non standard block hash for height ", block.Height, ", hash [", block.Hash, "]")
+		if len(b) > pl {
+			b = b[:pl]
+		} else {
+			b = append(b, make([]byte, pl-len(b))...)
+		}
 	}
 	packed = append(packed, b...)
 	packed = append(packed, packUint(uint32(block.Time))...)
@@ -1035,60 +1360,107 @@ func (d *RocksDB) writeHeight(wb *gorocksdb.WriteBatch, height uint32, bi *Block
 
 // Disconnect blocks
 
-func (d *RocksDB) allAddressesScan(lower uint32, higher uint32) ([][]byte, [][]byte, error) {
-	glog.Infof("db: doing full scan of addresses column")
-	addrKeys := [][]byte{}
-	addrValues := [][]byte{}
-	var totalOutputs, count uint64
-	var seekKey []byte
-	for {
-		var key []byte
-		it := d.db.NewIteratorCF(d.ro, d.cfh[cfAddresses])
-		if totalOutputs == 0 {
-			it.SeekToFirst()
-		} else {
-			it.Seek(seekKey)
-			it.Next()
-		}
-		for count = 0; it.Valid() && count < refreshIterator; it.Next() {
-			totalOutputs++
-			count++
-			key = it.Key().Data()
-			l := len(key)
-			if l > packedHeightBytes {
-				height := unpackUint(key[l-packedHeightBytes : l])
-				if height >= lower && height <= higher {
-					addrKey := make([]byte, len(key))
-					copy(addrKey, key)
-					addrKeys = append(addrKeys, addrKey)
-					value := it.Value().Data()
-					addrValue := make([]byte, len(value))
-					copy(addrValue, value)
-					addrValues = append(addrValues, addrValue)
+func (d *RocksDB) disconnectTxAddressesInputs(wb *gorocksdb.WriteBatch, btxID []byte, inputs []outpoint, txa *TxAddresses, txAddressesToUpdate map[string]*TxAddresses,
+	getAddressBalance func(addrDesc bchain.AddressDescriptor) (*AddrBalance, error),
+	addressFoundInTx func(addrDesc bchain.AddressDescriptor, btxID []byte) bool) error {
+	var err error
+	var balance *AddrBalance
+	for i, t := range txa.Inputs {
+		if len(t.AddrDesc) > 0 {
+			input := &inputs[i]
+			exist := addressFoundInTx(t.AddrDesc, btxID)
+			s := string(input.btxID)
+			sa, found := txAddressesToUpdate[s]
+			if !found {
+				sa, err = d.getTxAddresses(input.btxID)
+				if err != nil {
+					return err
+				}
+				if sa != nil {
+					txAddressesToUpdate[s] = sa
+				}
+			}
+			var inputHeight uint32
+			if sa != nil {
+				sa.Outputs[input.index].Spent = false
+				inputHeight = sa.Height
+			}
+			if d.chainParser.IsAddrDescIndexable(t.AddrDesc) {
+				balance, err = getAddressBalance(t.AddrDesc)
+				if err != nil {
+					return err
+				}
+				if balance != nil {
+					// subtract number of txs only once
+					if !exist {
+						balance.Txs--
+					}
+					balance.SentSat.Sub(&balance.SentSat, &t.ValueSat)
+					if balance.SentSat.Sign() < 0 {
+						d.resetValueSatToZero(&balance.SentSat, t.AddrDesc, "sent amount")
+					}
+					balance.BalanceSat.Add(&balance.BalanceSat, &t.ValueSat)
+					balance.addUtxoInDisconnect(&Utxo{
+						BtxID:    input.btxID,
+						Vout:     input.index,
+						Height:   inputHeight,
+						ValueSat: t.ValueSat,
+					})
+				} else {
+					ad, _, _ := d.chainParser.GetAddressesFromAddrDesc(t.AddrDesc)
+					glog.Warningf("Balance for address %s (%s) not found", ad, t.AddrDesc)
 				}
 			}
 		}
-		seekKey = make([]byte, len(key))
-		copy(seekKey, key)
-		valid := it.Valid()
-		it.Close()
-		if !valid {
-			break
-		}
 	}
-	glog.Infof("rocksdb: scanned %d addresses, found %d to disconnect", totalOutputs, len(addrKeys))
-	return addrKeys, addrValues, nil
+	return nil
 }
 
-func (d *RocksDB) disconnectTxAddresses(wb *gorocksdb.WriteBatch, height uint32, txid string, inputs []outpoint, txa *TxAddresses,
-	txAddressesToUpdate map[string]*TxAddresses, balances map[string]*AddrBalance) error {
-	addresses := make(map[string]struct{})
+func (d *RocksDB) disconnectTxAddressesOutputs(wb *gorocksdb.WriteBatch, btxID []byte, txa *TxAddresses,
+	getAddressBalance func(addrDesc bchain.AddressDescriptor) (*AddrBalance, error),
+	addressFoundInTx func(addrDesc bchain.AddressDescriptor, btxID []byte) bool) error {
+	for i, t := range txa.Outputs {
+		if len(t.AddrDesc) > 0 {
+			exist := addressFoundInTx(t.AddrDesc, btxID)
+			if d.chainParser.IsAddrDescIndexable(t.AddrDesc) {
+				balance, err := getAddressBalance(t.AddrDesc)
+				if err != nil {
+					return err
+				}
+				if balance != nil {
+					// subtract number of txs only once
+					if !exist {
+						balance.Txs--
+					}
+					balance.BalanceSat.Sub(&balance.BalanceSat, &t.ValueSat)
+					if balance.BalanceSat.Sign() < 0 {
+						d.resetValueSatToZero(&balance.BalanceSat, t.AddrDesc, "balance")
+					}
+					balance.markUtxoAsSpent(btxID, int32(i))
+				} else {
+					ad, _, _ := d.chainParser.GetAddressesFromAddrDesc(t.AddrDesc)
+					glog.Warningf("Balance for address %s (%s) not found", ad, t.AddrDesc)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (d *RocksDB) disconnectBlock(height uint32, blockTxs []blockTxs) error {
+	wb := gorocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	txAddressesToUpdate := make(map[string]*TxAddresses)
+	txAddresses := make([]*TxAddresses, len(blockTxs))
+	txsToDelete := make(map[string]struct{})
+
+	balances := make(map[string]*AddrBalance)
 	getAddressBalance := func(addrDesc bchain.AddressDescriptor) (*AddrBalance, error) {
 		var err error
 		s := string(addrDesc)
 		b, fb := balances[s]
 		if !fb {
-			b, err = d.GetAddrDescBalance(addrDesc)
+			b, err = d.GetAddrDescBalance(addrDesc, addressBalanceDetailUTXOIndexed)
 			if err != nil {
 				return nil, err
 			}
@@ -1096,80 +1468,76 @@ func (d *RocksDB) disconnectTxAddresses(wb *gorocksdb.WriteBatch, height uint32,
 		}
 		return b, nil
 	}
-	for i, t := range txa.Inputs {
-		if len(t.AddrDesc) > 0 {
-			s := string(t.AddrDesc)
-			_, exist := addresses[s]
+
+	// all addresses in the block are stored in blockAddressesTxs, together with a map of transactions where they appear
+	blockAddressesTxs := make(map[string]map[string]struct{})
+	// addressFoundInTx handles updates of the blockAddressesTxs map and returns true if the address+tx was already encountered
+	addressFoundInTx := func(addrDesc bchain.AddressDescriptor, btxID []byte) bool {
+		sAddrDesc := string(addrDesc)
+		sBtxID := string(btxID)
+		a, exist := blockAddressesTxs[sAddrDesc]
+		if !exist {
+			blockAddressesTxs[sAddrDesc] = map[string]struct{}{sBtxID: {}}
+		} else {
+			_, exist = a[sBtxID]
 			if !exist {
-				addresses[s] = struct{}{}
-			}
-			b, err := getAddressBalance(t.AddrDesc)
-			if err != nil {
-				return err
-			}
-			if b != nil {
-				// subtract number of txs only once
-				if !exist {
-					b.Txs--
-				}
-				b.SentSat.Sub(&b.SentSat, &t.ValueSat)
-				if b.SentSat.Sign() < 0 {
-					d.resetValueSatToZero(&b.SentSat, t.AddrDesc, "sent amount")
-				}
-				b.BalanceSat.Add(&b.BalanceSat, &t.ValueSat)
-			} else {
-				ad, _, _ := d.chainParser.GetAddressesFromAddrDesc(t.AddrDesc)
-				glog.Warningf("Balance for address %s (%s) not found", ad, t.AddrDesc)
-			}
-			s = string(inputs[i].btxID)
-			sa, exist := txAddressesToUpdate[s]
-			if !exist {
-				sa, err = d.getTxAddresses(inputs[i].btxID)
-				if err != nil {
-					return err
-				}
-				txAddressesToUpdate[s] = sa
-			}
-			sa.Outputs[inputs[i].index].Spent = false
-		}
-	}
-	for _, t := range txa.Outputs {
-		if len(t.AddrDesc) > 0 {
-			s := string(t.AddrDesc)
-			_, exist := addresses[s]
-			if !exist {
-				addresses[s] = struct{}{}
-			}
-			b, err := getAddressBalance(t.AddrDesc)
-			if err != nil {
-				return err
-			}
-			if b != nil {
-				// subtract number of txs only once
-				if !exist {
-					b.Txs--
-				}
-				b.BalanceSat.Sub(&b.BalanceSat, &t.ValueSat)
-				if b.BalanceSat.Sign() < 0 {
-					d.resetValueSatToZero(&b.BalanceSat, t.AddrDesc, "balance")
-				}
-			} else {
-				ad, _, _ := d.chainParser.GetAddressesFromAddrDesc(t.AddrDesc)
-				glog.Warningf("Balance for address %s (%s) not found", ad, t.AddrDesc)
+				a[sBtxID] = struct{}{}
 			}
 		}
+		return exist
 	}
-	for a := range addresses {
+
+	glog.Info("Disconnecting block ", height, " containing ", len(blockTxs), " transactions")
+	// when connecting block, outputs are processed first
+	// when disconnecting, inputs must be reversed first
+	for i := range blockTxs {
+		btxID := blockTxs[i].btxID
+		s := string(btxID)
+		txsToDelete[s] = struct{}{}
+		txa, err := d.getTxAddresses(btxID)
+		if err != nil {
+			return err
+		}
+		if txa == nil {
+			ut, _ := d.chainParser.UnpackTxid(btxID)
+			glog.Warning("TxAddress for txid ", ut, " not found")
+			continue
+		}
+		txAddresses[i] = txa
+		if err := d.disconnectTxAddressesInputs(wb, btxID, blockTxs[i].inputs, txa, txAddressesToUpdate, getAddressBalance, addressFoundInTx); err != nil {
+			return err
+		}
+	}
+	for i := range blockTxs {
+		btxID := blockTxs[i].btxID
+		txa := txAddresses[i]
+		if txa == nil {
+			continue
+		}
+		if err := d.disconnectTxAddressesOutputs(wb, btxID, txa, getAddressBalance, addressFoundInTx); err != nil {
+			return err
+		}
+	}
+	for a := range blockAddressesTxs {
 		key := packAddressKey([]byte(a), height)
 		wb.DeleteCF(d.cfh[cfAddresses], key)
 	}
-	return nil
+	key := packUint(height)
+	wb.DeleteCF(d.cfh[cfBlockTxs], key)
+	wb.DeleteCF(d.cfh[cfHeight], key)
+	d.storeTxAddresses(wb, txAddressesToUpdate)
+	d.storeBalancesDisconnect(wb, balances)
+	for s := range txsToDelete {
+		b := []byte(s)
+		wb.DeleteCF(d.cfh[cfTransactions], b)
+		wb.DeleteCF(d.cfh[cfTxAddresses], b)
+	}
+	return d.db.Write(d.wo, wb)
 }
 
-// DisconnectBlockRangeUTXO removes all data belonging to blocks in range lower-higher
-// if they are in the range kept in the cfBlockTxids column
-func (d *RocksDB) DisconnectBlockRangeUTXO(lower uint32, higher uint32) error {
-	glog.Infof("db: disconnecting blocks %d-%d", lower, higher)
+// DisconnectBlockRangeBitcoinType removes all data belonging to blocks in range lower-higher
+// it is able to disconnect only blocks for which there are data in the blockTxs column
+func (d *RocksDB) DisconnectBlockRangeBitcoinType(lower uint32, higher uint32) error {
 	blocks := make([][]blockTxs, higher-lower+1)
 	for height := lower; height <= higher; height++ {
 		blockTxs, err := d.getBlockTxs(height)
@@ -1181,83 +1549,38 @@ func (d *RocksDB) DisconnectBlockRangeUTXO(lower uint32, higher uint32) error {
 		}
 		blocks[height-lower] = blockTxs
 	}
-	wb := gorocksdb.NewWriteBatch()
-	defer wb.Destroy()
-	txAddressesToUpdate := make(map[string]*TxAddresses)
-	txsToDelete := make(map[string]struct{})
-	balances := make(map[string]*AddrBalance)
 	for height := higher; height >= lower; height-- {
-		blockTxs := blocks[height-lower]
-		glog.Info("Disconnecting block ", height, " containing ", len(blockTxs), " transactions")
-		// go backwards to avoid interim negative balance
-		// when connecting block, amount is first in tx on the output side, then in another tx on the input side
-		// when disconnecting, it must be done backwards
-		for i := len(blockTxs) - 1; i >= 0; i-- {
-			txid := blockTxs[i].btxID
-			s := string(txid)
-			txsToDelete[s] = struct{}{}
-			txa, err := d.getTxAddresses(txid)
-			if err != nil {
-				return err
-			}
-			if txa == nil {
-				ut, _ := d.chainParser.UnpackTxid(txid)
-				glog.Warning("TxAddress for txid ", ut, " not found")
-				continue
-			}
-			if err := d.disconnectTxAddresses(wb, height, s, blockTxs[i].inputs, txa, txAddressesToUpdate, balances); err != nil {
-				return err
-			}
+		err := d.disconnectBlock(height, blocks[height-lower])
+		if err != nil {
+			return err
 		}
-		key := packUint(height)
-		wb.DeleteCF(d.cfh[cfBlockTxs], key)
-		wb.DeleteCF(d.cfh[cfHeight], key)
 	}
-	d.storeTxAddresses(wb, txAddressesToUpdate)
+	d.is.RemoveLastBlockTimes(int(higher-lower) + 1)
+	glog.Infof("rocksdb: blocks %d-%d disconnected", lower, higher)
+	return nil
+}
+
+func (d *RocksDB) storeBalancesDisconnect(wb *gorocksdb.WriteBatch, balances map[string]*AddrBalance) {
+	for _, b := range balances {
+		if b != nil {
+			// remove spent utxos
+			us := make([]Utxo, 0, len(b.Utxos))
+			for _, u := range b.Utxos {
+				// remove utxos marked as spent
+				if u.Vout >= 0 {
+					us = append(us, u)
+				}
+			}
+			b.Utxos = us
+			// sort utxos by height
+			sort.SliceStable(b.Utxos, func(i, j int) bool {
+				return b.Utxos[i].Height < b.Utxos[j].Height
+			})
+		}
+	}
 	d.storeBalances(wb, balances)
-	for s := range txsToDelete {
-		b := []byte(s)
-		wb.DeleteCF(d.cfh[cfTransactions], b)
-		wb.DeleteCF(d.cfh[cfTxAddresses], b)
-	}
-	err := d.db.Write(d.wo, wb)
-	if err == nil {
-		glog.Infof("rocksdb: blocks %d-%d disconnected", lower, higher)
-	}
-	return err
-}
 
-// DisconnectBlockRangeNonUTXO performs full range scan to remove a range of blocks
-// it is very slow operation
-func (d *RocksDB) DisconnectBlockRangeNonUTXO(lower uint32, higher uint32) error {
-	glog.Infof("db: disconnecting blocks %d-%d", lower, higher)
-	addrKeys, _, err := d.allAddressesScan(lower, higher)
-	if err != nil {
-		return err
-	}
-	glog.Infof("rocksdb: about to disconnect %d addresses ", len(addrKeys))
-	wb := gorocksdb.NewWriteBatch()
-	defer wb.Destroy()
-	for _, addrKey := range addrKeys {
-		if glog.V(2) {
-			glog.Info("address ", hex.EncodeToString(addrKey))
-		}
-		// delete address:height from the index
-		wb.DeleteCF(d.cfh[cfAddresses], addrKey)
-	}
-	for height := lower; height <= higher; height++ {
-		if glog.V(2) {
-			glog.Info("height ", height)
-		}
-		wb.DeleteCF(d.cfh[cfHeight], packUint(height))
-	}
-	err = d.db.Write(d.wo, wb)
-	if err == nil {
-		glog.Infof("rocksdb: blocks %d-%d disconnected", lower, higher)
-	}
-	return err
 }
-
 func dirSize(path string) (int64, error) {
 	var size int64
 	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
@@ -1275,7 +1598,7 @@ func dirSize(path string) (int64, error) {
 func (d *RocksDB) DatabaseSizeOnDisk() int64 {
 	size, err := dirSize(d.path)
 	if err != nil {
-		glog.Error("rocksdb: DatabaseSizeOnDisk: ", err)
+		glog.Warning("rocksdb: DatabaseSizeOnDisk: ", err)
 		return 0
 	}
 	return size
@@ -1346,6 +1669,34 @@ func (d *RocksDB) internalDeleteTx(wb *gorocksdb.WriteBatch, key []byte) {
 // internal state
 const internalStateKey = "internalState"
 
+func (d *RocksDB) loadBlockTimes() ([]uint32, error) {
+	var times []uint32
+	it := d.db.NewIteratorCF(d.ro, d.cfh[cfHeight])
+	defer it.Close()
+	counter := uint32(0)
+	time := uint32(0)
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		height := unpackUint(it.Key().Data())
+		if height > counter {
+			glog.Warning("gap in cfHeight: expecting ", counter, ", got ", height)
+			for ; counter < height; counter++ {
+				times = append(times, time)
+			}
+		}
+		counter++
+		info, err := d.unpackBlockInfo(it.Value().Data())
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			time = uint32(info.Time)
+		}
+		times = append(times, time)
+	}
+	glog.Info("loaded ", len(times), " block times")
+	return times, nil
+}
+
 // LoadInternalState loads from db internal state or initializes a new one if not yet stored
 func (d *RocksDB) LoadInternalState(rpcCoin string) (*common.InternalState, error) {
 	val, err := d.db.GetCF(d.ro, d.cfh[cfDefault], []byte(internalStateKey))
@@ -1356,7 +1707,7 @@ func (d *RocksDB) LoadInternalState(rpcCoin string) (*common.InternalState, erro
 	data := val.Data()
 	var is *common.InternalState
 	if len(data) == 0 {
-		is = &common.InternalState{Coin: rpcCoin}
+		is = &common.InternalState{Coin: rpcCoin, UtxoChecked: true}
 	} else {
 		is, err = common.UnpackInternalState(data)
 		if err != nil {
@@ -1391,6 +1742,10 @@ func (d *RocksDB) LoadInternalState(rpcCoin string) (*common.InternalState, erro
 		}
 	}
 	is.DbColumns = nc
+	is.BlockTimes, err = d.loadBlockTimes()
+	if err != nil {
+		return nil, err
+	}
 	// after load, reset the synchronization data
 	is.IsSynchronized = false
 	is.IsMempoolSynchronized = false
@@ -1494,13 +1849,199 @@ func (d *RocksDB) ComputeInternalStateColumnStats(stopCompute chan os.Signal) er
 	return nil
 }
 
+func reorderUtxo(utxos []Utxo, index int) {
+	var from, to int
+	for from = index; from >= 0; from-- {
+		if !bytes.Equal(utxos[from].BtxID, utxos[index].BtxID) {
+			break
+		}
+	}
+	from++
+	for to = index + 1; to < len(utxos); to++ {
+		if !bytes.Equal(utxos[to].BtxID, utxos[index].BtxID) {
+			break
+		}
+	}
+	toSort := utxos[from:to]
+	sort.SliceStable(toSort, func(i, j int) bool {
+		return toSort[i].Vout < toSort[j].Vout
+	})
+
+}
+
+func (d *RocksDB) fixUtxo(addrDesc bchain.AddressDescriptor, ba *AddrBalance) (bool, bool, error) {
+	reorder := false
+	var checksum big.Int
+	var prevUtxo *Utxo
+	for i := range ba.Utxos {
+		utxo := &ba.Utxos[i]
+		checksum.Add(&checksum, &utxo.ValueSat)
+		if prevUtxo != nil {
+			if prevUtxo.Vout > utxo.Vout && *(*int)(unsafe.Pointer(&utxo.BtxID[0])) == *(*int)(unsafe.Pointer(&prevUtxo.BtxID[0])) && bytes.Equal(utxo.BtxID, prevUtxo.BtxID) {
+				reorderUtxo(ba.Utxos, i)
+				reorder = true
+			}
+		}
+		prevUtxo = utxo
+	}
+	if reorder {
+		// get the checksum again after reorder
+		checksum.SetInt64(0)
+		for i := range ba.Utxos {
+			utxo := &ba.Utxos[i]
+			checksum.Add(&checksum, &utxo.ValueSat)
+		}
+	}
+	if checksum.Cmp(&ba.BalanceSat) != 0 {
+		var checksumFromTxs big.Int
+		var utxos []Utxo
+		err := d.GetAddrDescTransactions(addrDesc, 0, ^uint32(0), func(txid string, height uint32, indexes []int32) error {
+			var ta *TxAddresses
+			var err error
+			// sort the indexes so that the utxos are appended in the reverse order
+			sort.Slice(indexes, func(i, j int) bool {
+				return indexes[i] > indexes[j]
+			})
+			for _, index := range indexes {
+				// take only outputs
+				if index < 0 {
+					break
+				}
+				if ta == nil {
+					ta, err = d.GetTxAddresses(txid)
+					if err != nil {
+						return err
+					}
+				}
+				if ta == nil {
+					return errors.New("DB inconsistency:  tx " + txid + ": not found in txAddresses")
+				}
+				if len(ta.Outputs) <= int(index) {
+					glog.Warning("DB inconsistency:  txAddresses " + txid + " does not have enough outputs")
+				} else {
+					tao := &ta.Outputs[index]
+					if !tao.Spent {
+						bTxid, _ := d.chainParser.PackTxid(txid)
+						checksumFromTxs.Add(&checksumFromTxs, &tao.ValueSat)
+						utxos = append(utxos, Utxo{BtxID: bTxid, Height: height, Vout: index, ValueSat: tao.ValueSat})
+						if checksumFromTxs.Cmp(&ba.BalanceSat) == 0 {
+							return &StopIteration{}
+						}
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return false, false, err
+		}
+		fixed := false
+		if checksumFromTxs.Cmp(&ba.BalanceSat) == 0 {
+			// reverse the utxos as they are added in descending order by height
+			for i := len(utxos)/2 - 1; i >= 0; i-- {
+				opp := len(utxos) - 1 - i
+				utxos[i], utxos[opp] = utxos[opp], utxos[i]
+			}
+			ba.Utxos = utxos
+			wb := gorocksdb.NewWriteBatch()
+			err = d.storeBalances(wb, map[string]*AddrBalance{string(addrDesc): ba})
+			if err == nil {
+				err = d.db.Write(d.wo, wb)
+			}
+			wb.Destroy()
+			if err != nil {
+				return false, false, errors.Errorf("balance %s, checksum %s, from txa %s, txs %d, error storing fixed utxos %v", ba.BalanceSat.String(), checksum.String(), checksumFromTxs.String(), ba.Txs, err)
+			}
+			fixed = true
+		}
+		return fixed, false, errors.Errorf("balance %s, checksum %s, from txa %s, txs %d", ba.BalanceSat.String(), checksum.String(), checksumFromTxs.String(), ba.Txs)
+	} else if reorder {
+		wb := gorocksdb.NewWriteBatch()
+		err := d.storeBalances(wb, map[string]*AddrBalance{string(addrDesc): ba})
+		if err == nil {
+			err = d.db.Write(d.wo, wb)
+		}
+		wb.Destroy()
+		if err != nil {
+			return false, false, errors.Errorf("error storing reordered utxos %v", err)
+		}
+	}
+	return false, reorder, nil
+}
+
+// FixUtxos checks and fixes possible
+func (d *RocksDB) FixUtxos(stop chan os.Signal) error {
+	if d.chainParser.GetChainType() != bchain.ChainBitcoinType {
+		glog.Info("FixUtxos: applicable only for bitcoin type coins")
+		return nil
+	}
+	glog.Info("FixUtxos: starting")
+	var row, errorsCount, fixedCount int64
+	var seekKey []byte
+	// do not use cache
+	ro := gorocksdb.NewDefaultReadOptions()
+	ro.SetFillCache(false)
+	for {
+		var addrDesc bchain.AddressDescriptor
+		it := d.db.NewIteratorCF(ro, d.cfh[cfAddressBalance])
+		if row == 0 {
+			it.SeekToFirst()
+		} else {
+			glog.Info("FixUtxos: row ", row, ", errors ", errorsCount)
+			it.Seek(seekKey)
+			it.Next()
+		}
+		for count := 0; it.Valid() && count < refreshIterator; it.Next() {
+			select {
+			case <-stop:
+				return errors.New("Interrupted")
+			default:
+			}
+			addrDesc = it.Key().Data()
+			buf := it.Value().Data()
+			count++
+			row++
+			if len(buf) < 3 {
+				glog.Error("FixUtxos: row ", row, ", addrDesc ", addrDesc, ", empty data")
+				errorsCount++
+				continue
+			}
+			ba, err := unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), AddressBalanceDetailUTXO)
+			if err != nil {
+				glog.Error("FixUtxos: row ", row, ", addrDesc ", addrDesc, ", unpackAddrBalance error ", err)
+				errorsCount++
+				continue
+			}
+			fixed, reordered, err := d.fixUtxo(addrDesc, ba)
+			if err != nil {
+				errorsCount++
+				glog.Error("FixUtxos: row ", row, ", addrDesc ", addrDesc, ", error ", err, ", fixed ", fixed)
+				if fixed {
+					fixedCount++
+				}
+			} else if reordered {
+				glog.Error("FixUtxos: row ", row, ", addrDesc ", addrDesc, " reordered")
+				fixedCount++
+			}
+		}
+		seekKey = append([]byte{}, addrDesc...)
+		valid := it.Valid()
+		it.Close()
+		if !valid {
+			break
+		}
+	}
+	glog.Info("FixUtxos: finished, scanned ", row, " rows, found ", errorsCount, " errors, fixed ", fixedCount)
+	return nil
+}
+
 // Helpers
 
 func packAddressKey(addrDesc bchain.AddressDescriptor, height uint32) []byte {
-	bheight := packUint(height)
-	buf := make([]byte, 0, len(addrDesc)+len(bheight))
-	buf = append(buf, addrDesc...)
-	buf = append(buf, bheight...)
+	buf := make([]byte, len(addrDesc)+packedHeightBytes)
+	copy(buf, addrDesc)
+	// pack height as binary complement to achieve ordering from newest to oldest block
+	binary.BigEndian.PutUint32(buf[len(addrDesc):], ^height)
 	return buf
 }
 
@@ -1509,7 +2050,8 @@ func unpackAddressKey(key []byte) ([]byte, uint32, error) {
 	if i <= 0 {
 		return nil, 0, errors.New("Invalid address key")
 	}
-	return key[:i], unpackUint(key[i : i+packedHeightBytes]), nil
+	// height is packed in binary complement, convert it
+	return key[:i], ^unpackUint(key[i : i+packedHeightBytes]), nil
 }
 
 func packUint(i uint32) []byte {

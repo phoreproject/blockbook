@@ -3,7 +3,6 @@
 package namecoin
 
 import (
-	"blockbook/bchain/coins/btc"
 	"bytes"
 	"encoding/hex"
 	"fmt"
@@ -13,7 +12,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/jakm/btcutil/chaincfg"
+	"github.com/martinboehm/btcutil/chaincfg"
+	"github.com/trezor/blockbook/bchain/coins/btc"
 )
 
 func TestMain(m *testing.M) {
@@ -69,7 +69,7 @@ type testBlock struct {
 }
 
 var testParseBlockTxs = map[int]testBlock{
-	40000: testBlock{
+	40000: {
 		size: 1385,
 		time: 1327728573,
 		txs: []string{

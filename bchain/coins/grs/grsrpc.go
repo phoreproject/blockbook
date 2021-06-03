@@ -1,18 +1,20 @@
 package grs
 
 import (
-	"blockbook/bchain"
-	"blockbook/bchain/coins/btc"
 	"encoding/json"
 
 	"github.com/golang/glog"
 	"github.com/juju/errors"
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/bchain/coins/btc"
 )
 
+// GroestlcoinRPC is an interface to JSON-RPC service
 type GroestlcoinRPC struct {
 	*btc.BitcoinRPC
 }
 
+// NewGroestlcoinRPC returns new GroestlcoinRPC instance
 func NewGroestlcoinRPC(config json.RawMessage, pushHandler func(bchain.NotificationType)) (bchain.BlockChain, error) {
 	b, err := btc.NewBitcoinRPC(config, pushHandler)
 	if err != nil {
@@ -27,10 +29,11 @@ func NewGroestlcoinRPC(config json.RawMessage, pushHandler func(bchain.Notificat
 
 // Initialize initializes GroestlcoinRPC instance.
 func (g *GroestlcoinRPC) Initialize() error {
-	chainName, err := g.GetChainInfoAndInitializeMempool(g)
+	ci, err := g.GetChainInfo()
 	if err != nil {
 		return err
 	}
+	chainName := ci.Chain
 
 	params := GetChainParams(chainName)
 
@@ -79,7 +82,7 @@ func (g *GroestlcoinRPC) GetBlock(hash string, height uint32) (*bchain.Block, er
 	for _, txid := range res.Result.Txids {
 		tx, err := g.GetTransaction(txid)
 		if err != nil {
-			if isInvalidTx(err) {
+			if err == bchain.ErrTxNotFound {
 				glog.Errorf("rpc: getblock: skipping transanction in block %s due error: %s", hash, err)
 				continue
 			}
@@ -92,20 +95,6 @@ func (g *GroestlcoinRPC) GetBlock(hash string, height uint32) (*bchain.Block, er
 		Txs:         txs,
 	}
 	return block, nil
-}
-
-func isInvalidTx(err error) bool {
-	switch e1 := err.(type) {
-	case *errors.Err:
-		switch e2 := e1.Cause().(type) {
-		case *bchain.RPCError:
-			if e2.Code == -5 { // "No information available about transaction"
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // GetTransactionForMempool returns a transaction by the transaction ID.

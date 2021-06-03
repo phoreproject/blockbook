@@ -1,9 +1,12 @@
+// +build unittest
+
 package bchain
 
 import (
-	"encoding/json"
 	"math/big"
 	"testing"
+
+	"github.com/trezor/blockbook/common"
 )
 
 func NewBaseParser(adp int) *BaseParser {
@@ -27,7 +30,8 @@ var amounts = []struct {
 	{big.NewInt(-8), "-0.00000008", 8, "!"},
 	{big.NewInt(-89012345678), "-890.12345678", 8, "!"},
 	{big.NewInt(-12345), "-0.00012345", 8, "!"},
-	{big.NewInt(12345678), "0.123456789012", 8, "0.12345678"}, // test of truncation of too many decimal places
+	{big.NewInt(12345678), "0.123456789012", 8, "0.12345678"},                       // test of truncation of too many decimal places
+	{big.NewInt(12345678), "0.0000000000000000000000000000000012345678", 1234, "!"}, // test of too big number decimal places
 }
 
 func TestBaseParser_AmountToDecimalString(t *testing.T) {
@@ -43,7 +47,7 @@ func TestBaseParser_AmountToDecimalString(t *testing.T) {
 func TestBaseParser_AmountToBigInt(t *testing.T) {
 	for _, tt := range amounts {
 		t.Run(tt.s, func(t *testing.T) {
-			got, err := NewBaseParser(tt.adp).AmountToBigInt(json.Number(tt.s))
+			got, err := NewBaseParser(tt.adp).AmountToBigInt(common.JSONNumber(tt.s))
 			if err != nil {
 				t.Errorf("BaseParser.AmountToBigInt() error = %v", err)
 				return

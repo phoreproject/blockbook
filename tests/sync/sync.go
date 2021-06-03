@@ -3,15 +3,16 @@
 package sync
 
 import (
-	"blockbook/bchain"
-	"blockbook/common"
-	"blockbook/db"
 	"encoding/json"
 	"errors"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/common"
+	"github.com/trezor/blockbook/db"
 )
 
 var testMap = map[string]func(t *testing.T, th *TestHandler){
@@ -54,7 +55,7 @@ type BlockInfo struct {
 	TxDetails []*bchain.Tx `json:"txDetails"`
 }
 
-func IntegrationTest(t *testing.T, coin string, chain bchain.BlockChain, testConfig json.RawMessage) {
+func IntegrationTest(t *testing.T, coin string, chain bchain.BlockChain, mempool bchain.Mempool, testConfig json.RawMessage) {
 	tests, err := getTests(testConfig)
 	if err != nil {
 		t.Fatalf("Failed loading of test list: %s", err)

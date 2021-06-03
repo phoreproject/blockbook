@@ -3,7 +3,6 @@
 package btg
 
 import (
-	"blockbook/bchain/coins/btc"
 	"bytes"
 	"encoding/hex"
 	"fmt"
@@ -12,7 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jakm/btcutil/chaincfg"
+	"github.com/martinboehm/btcutil/chaincfg"
+	"github.com/trezor/blockbook/bchain/coins/btc"
 )
 
 func TestMain(m *testing.M) {
@@ -28,7 +28,7 @@ type testBlock struct {
 }
 
 var testParseBlockTxs = map[int]testBlock{
-	104000: testBlock{
+	104000: {
 		size: 15776,
 		time: 1295705889,
 		txs: []string{
@@ -81,7 +81,7 @@ var testParseBlockTxs = map[int]testBlock{
 			"33ad36d79d63b575c7532c516f16b19541f5c637caf7073beb7ddf604c3f39cc",
 		},
 	},
-	532144: testBlock{
+	532144: {
 		size: 12198,
 		time: 1528372417,
 		txs: []string{

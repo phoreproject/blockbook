@@ -1,8 +1,6 @@
 package db
 
 import (
-	"blockbook/bchain"
-	"blockbook/common"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -10,6 +8,8 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/juju/errors"
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/common"
 )
 
 // SyncWorker is handle to SyncWorker
@@ -44,6 +44,35 @@ func NewSyncWorker(db *RocksDB, chain bchain.BlockChain, syncWorkers, syncChunk 
 }
 
 var errSynced = errors.New("synced")
+var errFork = errors.New("fork")
+
+// ErrOperationInterrupted is returned when operation is interrupted by OS signal
+var ErrOperationInterrupted = errors.New("ErrOperationInterrupted")
+
+func (w *SyncWorker) updateBackendInfo() {
+	ci, err := w.chain.GetChainInfo()
+	var backendError string
+	if err != nil {
+		glog.Error("GetChainInfo error ", err)
+		backendError = errors.Annotatef(err, "GetChainInfo").Error()
+		ci = &bchain.ChainInfo{}
+	}
+	w.is.SetBackendInfo(&common.BackendInfo{
+		BackendError:    backendError,
+		BestBlockHash:   ci.Bestblockhash,
+		Blocks:          ci.Blocks,
+		Chain:           ci.Chain,
+		Difficulty:      ci.Difficulty,
+		Headers:         ci.Headers,
+		ProtocolVersion: ci.ProtocolVersion,
+		SizeOnDisk:      ci.SizeOnDisk,
+		Subversion:      ci.Subversion,
+		Timeoffset:      ci.Timeoffset,
+		Version:         ci.Version,
+		Warnings:        ci.Warnings,
+		Consensus:       ci.Consensus,
+	})
+}
 
 // ResyncIndex synchronizes index to the top of the blockchain
 // onNewBlock is called when new block is connected, but not in initial parallel sync
@@ -52,6 +81,9 @@ func (w *SyncWorker) ResyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 	w.is.StartedSync()
 
 	err := w.resyncIndex(onNewBlock, initialSync)
+
+	// update backend info after each resync
+	w.updateBackendInfo()
 
 	switch err {
 	case nil:
@@ -63,15 +95,21 @@ func (w *SyncWorker) ResyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 		if err == nil {
 			w.is.FinishedSync(bh)
 		}
-		return nil
+		w.metrics.BackendBestHeight.Set(float64(w.is.BackendInfo.Blocks))
+		w.metrics.BlockbookBestHeight.Set(float64(bh))
+		return err
 	case errSynced:
 		// this is not actually error but flag that resync wasn't necessary
 		w.is.FinishedSyncNoChange()
 		w.metrics.IndexDBSize.Set(float64(w.db.DatabaseSizeOnDisk()))
+		if initialSync {
+			d := time.Since(start)
+			glog.Info("resync: finished in ", d)
+		}
 		return nil
 	}
 
-	w.metrics.IndexResyncErrors.With(common.Labels{"error": err.Error()}).Inc()
+	w.metrics.IndexResyncErrors.With(common.Labels{"error": "failure"}).Inc()
 
 	return err
 }
@@ -98,7 +136,7 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 		}
 		if remoteHash != localBestHash {
 			// forked - the remote hash differs from the local hash at the same height
-			glog.Info("resync: local is forked at height ", localBestHeight, ", local hash ", localBestHash, ", remote hash", remoteHash)
+			glog.Info("resync: local is forked at height ", localBestHeight, ", local hash ", localBestHash, ", remote hash ", remoteHash)
 			return w.handleFork(localBestHeight, localBestHash, onNewBlock, initialSync)
 		}
 		glog.Info("resync: local at ", localBestHeight, " is behind")
@@ -113,7 +151,8 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 	}
 	// if parallel operation is enabled and the number of blocks to be connected is large,
 	// use parallel routine to load majority of blocks
-	if w.syncWorkers > 1 {
+	// use parallel sync only in case of initial sync because it puts the db to inconsistent state
+	if w.syncWorkers > 1 && initialSync {
 		remoteBestHeight, err := w.chain.GetBestBlockHeight()
 		if err != nil {
 			return err
@@ -133,7 +172,11 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 			return w.resyncIndex(onNewBlock, initialSync)
 		}
 	}
-	return w.connectBlocks(onNewBlock, initialSync)
+	err = w.connectBlocks(onNewBlock, initialSync)
+	if err == errFork {
+		return w.resyncIndex(onNewBlock, initialSync)
+	}
+	return err
 }
 
 func (w *SyncWorker) handleFork(localBestHeight uint32, localBestHash string, onNewBlock bchain.OnNewBlockFunc, initialSync bool) error {
@@ -185,6 +228,7 @@ func (w *SyncWorker) connectBlocks(onNewBlock bchain.OnNewBlockFunc, initialSync
 		if onNewBlock != nil {
 			onNewBlock(res.block.Hash, res.block.Height)
 		}
+		w.metrics.BlockbookBestHeight.Set(float64(res.block.Height))
 		if res.block.Height > 0 && res.block.Height%1000 == 0 {
 			glog.Info("connected block ", res.block.Height, " ", res.block.Hash)
 		}
@@ -197,7 +241,8 @@ func (w *SyncWorker) connectBlocks(onNewBlock bchain.OnNewBlockFunc, initialSync
 		for {
 			select {
 			case <-w.chanOsSignal:
-				return errors.Errorf("connectBlocks interrupted at height %d", lastRes.block.Height)
+				glog.Info("connectBlocks interrupted at height ", lastRes.block.Height)
+				return ErrOperationInterrupted
 			case res := <-bch:
 				if res == empty {
 					break ConnectLoop
@@ -291,7 +336,7 @@ func (w *SyncWorker) ConnectBlocksParallel(lower, higher uint32) error {
 						return
 					}
 					glog.Error("getBlockWorker ", i, " connect block error ", err, ". Retrying...")
-					w.metrics.IndexResyncErrors.With(common.Labels{"error": err.Error()}).Inc()
+					w.metrics.IndexResyncErrors.With(common.Labels{"error": "failure"}).Inc()
 					time.Sleep(time.Millisecond * 500)
 				} else {
 					break
@@ -320,7 +365,8 @@ ConnectLoop:
 	for h := lower; h <= higher; {
 		select {
 		case <-w.chanOsSignal:
-			err = errors.Errorf("connectBlocksParallel interrupted at height %d", h)
+			glog.Info("connectBlocksParallel interrupted at height ", h)
+			err = ErrOperationInterrupted
 			// signal all workers to terminate their loops (error loops are interrupted below)
 			close(terminating)
 			break ConnectLoop
@@ -328,12 +374,13 @@ ConnectLoop:
 			hash, err = w.chain.GetBlockHash(h)
 			if err != nil {
 				glog.Error("GetBlockHash error ", err)
-				w.metrics.IndexResyncErrors.With(common.Labels{"error": err.Error()}).Inc()
+				w.metrics.IndexResyncErrors.With(common.Labels{"error": "failure"}).Inc()
 				time.Sleep(time.Millisecond * 500)
 				continue
 			}
 			hch <- hashHeight{hash, h}
 			if h > 0 && h%1000 == 0 {
+				w.metrics.BlockbookBestHeight.Set(float64(h))
 				glog.Info("connecting block ", h, " ", hash, ", elapsed ", time.Since(start), " ", w.db.GetAndResetConnectBlockStats())
 				start = time.Now()
 			}
@@ -367,9 +414,9 @@ func (w *SyncWorker) getBlockChain(out chan blockResult, done chan struct{}) {
 
 	hash := w.startHash
 	height := w.startHeight
+	prevHash := ""
 
-	// some coins do not return Next hash
-	// must loop until error
+	// loop until error ErrBlockNotFound
 	for {
 		select {
 		case <-done:
@@ -384,6 +431,12 @@ func (w *SyncWorker) getBlockChain(out chan blockResult, done chan struct{}) {
 			out <- blockResult{err: err}
 			return
 		}
+		if block.Prev != "" && prevHash != "" && prevHash != block.Prev {
+			glog.Infof("sync: fork detected at height %d %s, local prevHash %s, remote prevHash %s", height, block.Hash, prevHash, block.Prev)
+			out <- blockResult{err: errFork}
+			return
+		}
+		prevHash = block.Hash
 		hash = block.Next
 		height++
 		out <- blockResult{block: block}
@@ -393,26 +446,11 @@ func (w *SyncWorker) getBlockChain(out chan blockResult, done chan struct{}) {
 // DisconnectBlocks removes all data belonging to blocks in range lower-higher,
 func (w *SyncWorker) DisconnectBlocks(lower uint32, higher uint32, hashes []string) error {
 	glog.Infof("sync: disconnecting blocks %d-%d", lower, higher)
-	// if the chain is UTXO, always use DisconnectBlockRange
-	if w.chain.GetChainParser().IsUTXOChain() {
-		return w.db.DisconnectBlockRangeUTXO(lower, higher)
+	ct := w.chain.GetChainParser().GetChainType()
+	if ct == bchain.ChainBitcoinType {
+		return w.db.DisconnectBlockRangeBitcoinType(lower, higher)
+	} else if ct == bchain.ChainEthereumType {
+		return w.db.DisconnectBlockRangeEthereumType(lower, higher)
 	}
-	blocks := make([]*bchain.Block, len(hashes))
-	var err error
-	// try to get all blocks first to see if we can avoid full scan
-	for i, hash := range hashes {
-		blocks[i], err = w.chain.GetBlock(hash, 0)
-		if err != nil {
-			// cannot get a block, we must do full range scan
-			return w.db.DisconnectBlockRangeNonUTXO(lower, higher)
-		}
-	}
-	// got all blocks to be disconnected, disconnect them one after another
-	for i, block := range blocks {
-		glog.Info("Disconnecting block ", (int(higher) - i), " ", block.Hash)
-		if err = w.db.DisconnectBlock(block); err != nil {
-			return err
-		}
-	}
-	return nil
+	return errors.New("Unknown chain type")
 }

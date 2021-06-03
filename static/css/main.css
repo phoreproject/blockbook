@@ -87,7 +87,6 @@ h3 {
     position: absolute;
     top: 0;
     left: 0;
-    height: 53px;
     width: 100%;
     margin: 0;
     padding-bottom: 0;
@@ -98,31 +97,39 @@ h3 {
 
 .bg-trezor {
     background-color: #212121!important;
-    height: 53px;
+    padding-top: 3px;
+    padding-bottom: 2px;
+    z-index: 2;
 }
 
-.bg-trezor .navbar-text {
+.bg-trezor .navbar-brand {
     color: rgba(255, 255, 255);
     font-weight: bold;
     font-size: 19px;
+    fill: #FFFFFF;
 }
 
-.trezor-logo-svg-white svg {
-    fill: #FFFFFF;
-    margin-top: 6px;
+@media (max-width: 768px) {
+    .navbar {
+        font-size: 14px;
+    }
+    .bg-trezor .navbar-brand {
+        font-weight: normal;
+        font-size: 14px;
+    }
 }
 
 #wrap {
     min-height: 100%;
     height: auto;
     padding: 75px 0;
-    margin: 0 auto -53px;
+    margin: 0 auto -42px;
 }
 
 #footer {
     background-color: #212121;
     color: #fff;
-    height: 53px;
+    height: 42px;
     overflow: hidden;
 }
 
@@ -151,7 +158,6 @@ h3 {
     display: inline-block;
     padding: .7em 2em;
     font-size: 13px;
-    font-weight: 100;
     color: #fff;
     text-align: center;
     white-space: nowrap;
@@ -180,6 +186,26 @@ h3 {
 .txvalues-danger {
     background-color: #AC0015;
     text-transform: uppercase;
+}
+
+.tx-own {
+    background-color: #fbf8f0;
+}
+
+.tx-amt {
+    float: right!important;
+}
+
+.tx-in .tx-own .tx-amt {
+    color: #dc3545!important;
+}
+
+.tx-out .tx-own .tx-amt {
+    color: #28a745!important;
+}
+
+.tx-addr {
+    float: left!important;
 }
 
 .ellipsis {
@@ -214,17 +240,13 @@ h3 {
     font-weight: bold;
 }
 
+table.data-table table.data-table th {
+    border-top: 0;
+    font-weight: normal;
+}
+
 .alert .data-table {
     margin: 0;
-}
-
-.navbar-nav .nav-link {
-    padding-right: 0;
-    padding-left: .25rem;
-}
-
-.navbar-text .nav-link {
-    padding: 0;
 }
 
 ::-webkit-input-placeholder {
@@ -239,20 +261,13 @@ h3 {
     font-size: 14px;
 }
 
-.h-container {
-    display: -webkit-box;
-    display: -ms-flexbox;
-    -ms-flex-wrap: wrap;
-    flex-wrap: wrap;
-}
-
-.h-container-6 {
-    width: 50%;
+.h-container ul, .h-container h3 {
     margin: 0;
 }
 
-.h-container ul {
-    margin: 0;
+.h-container h5 {
+    margin-top: 6px;
+    margin-bottom: 0;
 }
 
 .page-link {
@@ -290,5 +305,5 @@ h3 {
 }
 
 .key {
-    color: #333 ;
+    color: #333;
 }

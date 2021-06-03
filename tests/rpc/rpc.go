@@ -3,16 +3,17 @@
 package rpc
 
 import (
-	"blockbook/bchain"
 	"encoding/json"
 	"io/ioutil"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/deckarep/golang-set"
+	mapset "github.com/deckarep/golang-set"
 	"github.com/juju/errors"
+	"github.com/trezor/blockbook/bchain"
 )
 
 var testMap = map[string]func(t *testing.T, th *TestHandler){
@@ -30,6 +31,7 @@ var testMap = map[string]func(t *testing.T, th *TestHandler){
 
 type TestHandler struct {
 	Chain    bchain.BlockChain
+	Mempool  bchain.Mempool
 	TestData *TestData
 }
 
@@ -37,11 +39,12 @@ type TestData struct {
 	BlockHeight uint32                `json:"blockHeight"`
 	BlockHash   string                `json:"blockHash"`
 	BlockTime   int64                 `json:"blockTime"`
+	BlockSize   int                   `json:"blockSize"`
 	BlockTxs    []string              `json:"blockTxs"`
 	TxDetails   map[string]*bchain.Tx `json:"txDetails"`
 }
 
-func IntegrationTest(t *testing.T, coin string, chain bchain.BlockChain, testConfig json.RawMessage) {
+func IntegrationTest(t *testing.T, coin string, chain bchain.BlockChain, mempool bchain.Mempool, testConfig json.RawMessage) {
 	tests, err := getTests(testConfig)
 	if err != nil {
 		t.Fatalf("Failed loading of test list: %s", err)
@@ -53,7 +56,11 @@ func IntegrationTest(t *testing.T, coin string, chain bchain.BlockChain, testCon
 		t.Fatalf("Failed loading of test data: %s", err)
 	}
 
-	h := TestHandler{Chain: chain, TestData: td}
+	h := TestHandler{
+		Chain:    chain,
+		Mempool:  mempool,
+		TestData: td,
+	}
 
 	for _, test := range tests {
 		if f, found := testMap[test]; found {
@@ -136,6 +143,7 @@ func testGetBlockHash(t *testing.T, h *TestHandler) {
 		t.Errorf("GetBlockHash() got %q, want %q", hash, h.TestData.BlockHash)
 	}
 }
+
 func testGetBlock(t *testing.T, h *TestHandler) {
 	blk, err := h.Chain.GetBlock(h.TestData.BlockHash, 0)
 	if err != nil {
@@ -153,6 +161,7 @@ func testGetBlock(t *testing.T, h *TestHandler) {
 		}
 	}
 }
+
 func testGetTransaction(t *testing.T, h *TestHandler) {
 	for txid, want := range h.TestData.TxDetails {
 		got, err := h.Chain.GetTransaction(txid)
@@ -166,33 +175,71 @@ func testGetTransaction(t *testing.T, h *TestHandler) {
 			continue
 		}
 		got.Confirmations = 0
+		// CoinSpecificData are not specified in the fixtures
+		got.CoinSpecificData = nil
+
+		normalizeAddresses(want, h.Chain.GetChainParser())
+		normalizeAddresses(got, h.Chain.GetChainParser())
 
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("GetTransaction() got %+v, want %+v", got, want)
+			t.Errorf("GetTransaction() got %+#v, want %+#v", got, want)
 		}
 	}
 }
+
 func testGetTransactionForMempool(t *testing.T, h *TestHandler) {
 	for txid, want := range h.TestData.TxDetails {
 		// reset fields that are not parsed by BlockChainParser
-		want.Confirmations, want.Blocktime, want.Time = 0, 0, 0
+		want.Confirmations, want.Blocktime, want.Time, want.CoinSpecificData = 0, 0, 0, nil
 
 		got, err := h.Chain.GetTransactionForMempool(txid)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		normalizeAddresses(want, h.Chain.GetChainParser())
+		normalizeAddresses(got, h.Chain.GetChainParser())
+
 		// transactions parsed from JSON may contain additional data
-		got.Confirmations, got.Blocktime, got.Time = 0, 0, 0
+		got.Confirmations, got.Blocktime, got.Time, got.CoinSpecificData = 0, 0, 0, nil
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("GetTransactionForMempool() got %+v, want %+v", got, want)
+			t.Errorf("GetTransactionForMempool() got %+#v, want %+#v", got, want)
 		}
 	}
 }
+
+// empty slice can be either []slice{} or nil; reflect.DeepEqual treats them as different value
+// remove checksums from ethereum addresses
+func normalizeAddresses(tx *bchain.Tx, parser bchain.BlockChainParser) {
+	for i := range tx.Vin {
+		if len(tx.Vin[i].Addresses) == 0 {
+			tx.Vin[i].Addresses = nil
+		} else {
+			if parser.GetChainType() == bchain.ChainEthereumType {
+				for j := range tx.Vin[i].Addresses {
+					tx.Vin[i].Addresses[j] = strings.ToLower(tx.Vin[i].Addresses[j])
+				}
+			}
+		}
+	}
+	for i := range tx.Vout {
+		if len(tx.Vout[i].ScriptPubKey.Addresses) == 0 {
+			tx.Vout[i].ScriptPubKey.Addresses = nil
+		} else {
+			if parser.GetChainType() == bchain.ChainEthereumType {
+				for j := range tx.Vout[i].ScriptPubKey.Addresses {
+					tx.Vout[i].ScriptPubKey.Addresses[j] = strings.ToLower(tx.Vout[i].ScriptPubKey.Addresses[j])
+				}
+			}
+		}
+	}
+}
+
 func testMempoolSync(t *testing.T, h *TestHandler) {
 	for i := 0; i < 3; i++ {
 		txs := getMempool(t, h)
 
-		n, err := h.Chain.ResyncMempool(nil)
+		n, err := h.Mempool.Resync()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -214,11 +261,11 @@ func testMempoolSync(t *testing.T, h *TestHandler) {
 
 		for txid, addrs := range txid2addrs {
 			for _, a := range addrs {
-				got, err := h.Chain.GetMempoolTransactions(a)
+				got, err := h.Mempool.GetTransactions(a)
 				if err != nil {
 					t.Fatalf("address %q: %s", a, err)
 				}
-				if !containsString(got, txid) {
+				if !containsTx(got, txid) {
 					t.Errorf("ResyncMempool() - for address %s, transaction %s wasn't found in mempool", a, txid)
 					return
 				}
@@ -230,6 +277,7 @@ func testMempoolSync(t *testing.T, h *TestHandler) {
 	}
 	t.Skip("Skipping test, all attempts to sync mempool failed due to network state changes")
 }
+
 func testEstimateSmartFee(t *testing.T, h *TestHandler) {
 	for _, blocks := range []int{1, 2, 3, 5, 10} {
 		fee, err := h.Chain.EstimateSmartFee(blocks, true)
@@ -244,6 +292,7 @@ func testEstimateSmartFee(t *testing.T, h *TestHandler) {
 		}
 	}
 }
+
 func testEstimateFee(t *testing.T, h *TestHandler) {
 	for _, blocks := range []int{1, 2, 3, 5, 10} {
 		fee, err := h.Chain.EstimateFee(blocks)
@@ -258,6 +307,7 @@ func testEstimateFee(t *testing.T, h *TestHandler) {
 		}
 	}
 }
+
 func testGetBestBlockHash(t *testing.T, h *TestHandler) {
 	for i := 0; i < 3; i++ {
 		hash, err := h.Chain.GetBestBlockHash()
@@ -289,6 +339,7 @@ func testGetBestBlockHash(t *testing.T, h *TestHandler) {
 	}
 	t.Error("GetBestBlockHash() didn't get the best hash")
 }
+
 func testGetBestBlockHeight(t *testing.T, h *TestHandler) {
 	for i := 0; i < 3; i++ {
 		height, err := h.Chain.GetBestBlockHeight()
@@ -307,11 +358,13 @@ func testGetBestBlockHeight(t *testing.T, h *TestHandler) {
 	}
 	t.Error("GetBestBlockHeigh() didn't get the the best heigh")
 }
+
 func testGetBlockHeader(t *testing.T, h *TestHandler) {
 	want := &bchain.BlockHeader{
 		Hash:   h.TestData.BlockHash,
 		Height: h.TestData.BlockHeight,
 		Time:   h.TestData.BlockTime,
+		Size:   h.TestData.BlockSize,
 	}
 
 	got, err := h.Chain.GetBlockHeader(h.TestData.BlockHash)
@@ -328,12 +381,12 @@ func testGetBlockHeader(t *testing.T, h *TestHandler) {
 	got.Prev, got.Next = "", ""
 
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("GetBlockHeader() got=%+v, want=%+v", got, want)
+		t.Errorf("GetBlockHeader() got=%+#v, want=%+#v", got, want)
 	}
 }
 
 func getMempool(t *testing.T, h *TestHandler) []string {
-	txs, err := h.Chain.GetMempool()
+	txs, err := h.Chain.GetMempoolTransactions()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +402,7 @@ func getTxid2addrs(t *testing.T, h *TestHandler, txs []string) map[string][]stri
 	for i := range txs {
 		tx, err := h.Chain.GetTransactionForMempool(txs[i])
 		if err != nil {
-			if isMissingTx(err) {
+			if err == bchain.ErrTxNotFound {
 				continue
 			}
 			t.Fatal(err)
@@ -366,20 +419,6 @@ func getTxid2addrs(t *testing.T, h *TestHandler, txs []string) map[string][]stri
 		}
 	}
 	return txid2addrs
-}
-
-func isMissingTx(err error) bool {
-	switch e1 := err.(type) {
-	case *errors.Err:
-		switch e2 := e1.Cause().(type) {
-		case *bchain.RPCError:
-			if e2.Code == -5 { // "No such mempool or blockchain transaction"
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 func intersect(a, b []string) []string {
@@ -399,9 +438,9 @@ func intersect(a, b []string) []string {
 	return res
 }
 
-func containsString(slice []string, s string) bool {
-	for i := range slice {
-		if slice[i] == s {
+func containsTx(o []bchain.Outpoint, tx string) bool {
+	for i := range o {
+		if o[i].Txid == tx {
 			return true
 		}
 	}

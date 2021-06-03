@@ -1,18 +1,38 @@
 package zec
 
 import (
-	"blockbook/bchain"
-	"blockbook/bchain/coins/btc"
 	"encoding/json"
 
 	"github.com/golang/glog"
 	"github.com/juju/errors"
+	"github.com/trezor/blockbook/bchain"
+	"github.com/trezor/blockbook/bchain/coins/btc"
+	"github.com/trezor/blockbook/common"
 )
 
+// ZCashRPC is an interface to JSON-RPC bitcoind service
 type ZCashRPC struct {
 	*btc.BitcoinRPC
 }
 
+type ResGetBlockChainInfo struct {
+	Error  *bchain.RPCError `json:"error"`
+	Result struct {
+		Chain         string            `json:"chain"`
+		Blocks        int               `json:"blocks"`
+		Headers       int               `json:"headers"`
+		Bestblockhash string            `json:"bestblockhash"`
+		Difficulty    common.JSONNumber `json:"difficulty"`
+		Pruned        bool              `json:"pruned"`
+		SizeOnDisk    int64             `json:"size_on_disk"`
+		Consensus     struct {
+			Chaintip  string `json:"chaintip"`
+			Nextblock string `json:"nextblock"`
+		} `json:"consensus"`
+	} `json:"result"`
+}
+
+// NewZCashRPC returns new ZCashRPC instance
 func NewZCashRPC(config json.RawMessage, pushHandler func(bchain.NotificationType)) (bchain.BlockChain, error) {
 	b, err := btc.NewBitcoinRPC(config, pushHandler)
 	if err != nil {
@@ -26,12 +46,13 @@ func NewZCashRPC(config json.RawMessage, pushHandler func(bchain.NotificationTyp
 	return z, nil
 }
 
-// Initialize initializes ZCashRPC instance.
+// Initialize initializes ZCashRPC instance
 func (z *ZCashRPC) Initialize() error {
-	chainName, err := z.GetChainInfoAndInitializeMempool(z)
+	ci, err := z.GetChainInfo()
 	if err != nil {
 		return err
 	}
+	chainName := ci.Chain
 
 	params := GetChainParams(chainName)
 
@@ -49,6 +70,41 @@ func (z *ZCashRPC) Initialize() error {
 	glog.Info("rpc: block chain ", params.Name)
 
 	return nil
+}
+
+func (z *ZCashRPC) GetChainInfo() (*bchain.ChainInfo, error) {
+	chainInfo := ResGetBlockChainInfo{}
+	err := z.Call(&btc.CmdGetBlockChainInfo{Method: "getblockchaininfo"}, &chainInfo)
+	if err != nil {
+		return nil, err
+	}
+	if chainInfo.Error != nil {
+		return nil, chainInfo.Error
+	}
+
+	networkInfo := btc.ResGetNetworkInfo{}
+	err = z.Call(&btc.CmdGetNetworkInfo{Method: "getnetworkinfo"}, &networkInfo)
+	if err != nil {
+		return nil, err
+	}
+	if networkInfo.Error != nil {
+		return nil, networkInfo.Error
+	}
+
+	return &bchain.ChainInfo{
+		Bestblockhash:   chainInfo.Result.Bestblockhash,
+		Blocks:          chainInfo.Result.Blocks,
+		Chain:           chainInfo.Result.Chain,
+		Difficulty:      string(chainInfo.Result.Difficulty),
+		Headers:         chainInfo.Result.Headers,
+		SizeOnDisk:      chainInfo.Result.SizeOnDisk,
+		Version:         string(networkInfo.Result.Version),
+		Subversion:      string(networkInfo.Result.Subversion),
+		ProtocolVersion: string(networkInfo.Result.ProtocolVersion),
+		Timeoffset:      networkInfo.Result.Timeoffset,
+		Consensus:       chainInfo.Result.Consensus,
+		Warnings:        networkInfo.Result.Warnings,
+	}, nil
 }
 
 // GetBlock returns block with given hash.
@@ -80,7 +136,7 @@ func (z *ZCashRPC) GetBlock(hash string, height uint32) (*bchain.Block, error) {
 	for _, txid := range res.Result.Txids {
 		tx, err := z.GetTransaction(txid)
 		if err != nil {
-			if isInvalidTx(err) {
+			if err == bchain.ErrTxNotFound {
 				glog.Errorf("rpc: getblock: skipping transanction in block %s due error: %s", hash, err)
 				continue
 			}
@@ -93,20 +149,6 @@ func (z *ZCashRPC) GetBlock(hash string, height uint32) (*bchain.Block, error) {
 		Txs:         txs,
 	}
 	return block, nil
-}
-
-func isInvalidTx(err error) bool {
-	switch e1 := err.(type) {
-	case *errors.Err:
-		switch e2 := e1.Cause().(type) {
-		case *bchain.RPCError:
-			if e2.Code == -5 { // "No information available about transaction"
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // GetTransactionForMempool returns a transaction by the transaction ID.
