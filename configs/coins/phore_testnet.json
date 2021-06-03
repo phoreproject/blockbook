@@ -23,7 +23,7 @@
     "package_revision": "phoreproject",
     "system_user": "phore",
     "version": "1.6.3",
-    "binary_url": "https://github.com/phoreproject/Phore/releases/download/v1.6.3/phore-1.6.3-x86_64-linux-gnu.tar.gz",
+    "binary_url": "https://github.com/phoreproject/Phore/releases/download/v1.7.0/phore-1.7.0-x86_64-linux-gnu.tar.gz",
     "verification_type": "gpg-sha256",
     "verification_source": "",
     "extract_command": "tar -C backend --strip 1 -xf",
