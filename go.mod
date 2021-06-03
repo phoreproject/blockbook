@@ -25,6 +25,7 @@ require (
 	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b
 	github.com/golang/protobuf v1.4.3
 	github.com/gorilla/websocket v1.4.2
+	github.com/jakm/btcutil v0.0.0-20181018112945-224b76333062 // indirect
 	github.com/juju/errors v0.0.0-20170703010042-c7d06af17c68
 	github.com/juju/loggo v0.0.0-20190526231331-6e530bcce5d8 // indirect
 	github.com/juju/testing v0.0.0-20191001232224-ce9dec17d28b // indirect

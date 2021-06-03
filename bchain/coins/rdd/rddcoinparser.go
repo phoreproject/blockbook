@@ -1,8 +1,8 @@
 package rdd
 
 import (
-	"blockbook/bchain"
 	"blockbook/bchain/coins/btc"
+	"github.com/trezor/blockbook/bchain"
 	"math/big"
 	"time"
 

@@ -53,8 +53,8 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/zec"
 	"github.com/trezor/blockbook/common"
 
-    "blockbook/bchain/coins/phr"
-    "blockbook/bchain/coins/rdd"
+	"github.com/phoreproject/blockbook/bchain/coins/phr"
+	"github.com/phoreproject/blockbook/bchain/coins/rdd"
 )
 
 type blockChainFactory func(config json.RawMessage, pushHandler func(bchain.NotificationType)) (bchain.BlockChain, error)
